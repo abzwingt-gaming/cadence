@@ -1,0 +1,13 @@
+/* custom.css
+ * This file is mounted from the host via Docker volume.
+ * Override any style here without rebuilding the image.
+ *
+ * Example: change accent color
+ *   :root { --accent: hotpink; }
+ *
+ * Example: hide the version line
+ *   #version { display: none; }
+ *
+ * Example: bigger artwork
+ *   :root { --art-size: 320px; }
+ */
