@@ -109,7 +109,7 @@ services:
     restart: unless-stopped
     command: >
       redis-server
-      --requirepass ${REDIS_PASSWORD:-}
+      --requirepass "${REDIS_PASSWORD:-}"
       --save ""
       --appendonly no
     expose:
@@ -117,7 +117,16 @@ services:
     networks:
       - services-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # redis-cli ping must supply the password when auth is enabled.
+      # REDIS_PASSWORD is injected via .env; falls back to empty string (no auth).
+      test:
+        - "CMD-SHELL"
+        - |
+          if [ -n "${REDIS_PASSWORD:-}" ]; then
+            redis-cli -a "${REDIS_PASSWORD}" ping | grep -q PONG
+          else
+            redis-cli ping | grep -q PONG
+          fi
       interval: 10s
       timeout: 5s
       retries: 3

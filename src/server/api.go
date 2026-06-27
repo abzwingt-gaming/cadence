@@ -19,6 +19,11 @@ import (
 // SIGHUP, or the filesystem watcher.
 var rescanRunning atomic.Bool
 
+// streamIdle reports whether the icecast monitor has set sentinel "idle" values.
+func streamIdle(title, artist string) bool {
+	return title == "" || title == "-" || artist == "-"
+}
+
 func Search() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -32,6 +37,10 @@ func Search() http.HandlerFunc {
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
+		}
+		// Always return an array, never JSON null.
+		if results == nil {
+			results = []SongData{}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(results)
@@ -91,6 +100,11 @@ func RequestBestMatch() http.HandlerFunc {
 func NowPlayingMetadata() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
+		// Guard: stream is idle or icecast unreachable.
+		if streamIdle(n.Song.Title, n.Song.Artist) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -108,6 +122,11 @@ func NowPlayingMetadata() http.HandlerFunc {
 func NowPlayingAlbumArt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
+		// Guard: stream is idle or icecast unreachable.
+		if streamIdle(n.Song.Title, n.Song.Artist) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
 		if err != nil || len(results) == 0 {
 			w.WriteHeader(http.StatusNotFound)
@@ -118,7 +137,7 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 
 		if cached, ok := artCache.Load(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
-			w.Write(cached.([]byte))
+			_, _ = w.Write(cached.([]byte))
 			return
 		}
 
@@ -167,7 +186,7 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 		}
 		artCache.Store(cacheKey, jsonBytes)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonBytes)
+		_, _ = w.Write(jsonBytes)
 	}
 }
 
@@ -177,6 +196,10 @@ func History() http.HandlerFunc {
 		snap := make([]playRecord, len(history))
 		copy(snap, history)
 		historyMu.Unlock()
+		// Always return an array, never JSON null.
+		if snap == nil {
+			snap = []playRecord{}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(snap)
 	}
@@ -198,7 +221,7 @@ func Listeners() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
 		listeners := n.Listeners
-		// -1 means icecast is unreachable / stream idle; report 0 to the client.
+		// -1 sentinel means icecast unreachable; report 0 to the client.
 		if listeners < 0 {
 			listeners = 0
 		}
@@ -232,7 +255,7 @@ func AdminRescan() http.HandlerFunc {
 		}
 		if !rescanRunning.CompareAndSwap(false, true) {
 			w.WriteHeader(http.StatusConflict)
-			w.Write([]byte("rescan already running"))
+			_, _ = w.Write([]byte("rescan already running"))
 			return
 		}
 		go func() {
@@ -261,7 +284,7 @@ func Healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		dbOK := dbActive != nil && dbActive.Ping() == nil
 		n := NowSnapshot()
-		icecastOK := n.Song.Title != "-" && n.Song.Title != ""
+		icecastOK := !streamIdle(n.Song.Title, n.Song.Artist)
 		status := "ok"
 		code := http.StatusOK
 		if !dbOK || !icecastOK {
