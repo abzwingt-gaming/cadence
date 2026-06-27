@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 )
 
@@ -32,18 +31,12 @@ func postgresInit() error {
 		return err
 	}
 
-	// Enable fuzzystrmatch
-	_, err = dbp.Exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-	if err != nil {
-		// 42710 = already exists - safe to ignore
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "42710" {
-			slog.Debug("fuzzystrmatch already enabled.")
-		} else {
-			slog.Warn("fuzzystrmatch enable failed; fuzzy search degraded.", "error", err)
-		}
+	// Enable fuzzystrmatch for levenshtein search. Failure is non-fatal;
+	// search degrades to ILIKE only.
+	if _, err = dbp.Exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch"); err != nil {
+		slog.Warn("fuzzystrmatch enable failed; fuzzy search degraded.", "error", err)
 	}
 
-	// Create table if not exists - never drop/recreate the whole DB
 	createTable := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
 			id     SERIAL PRIMARY KEY,
@@ -54,8 +47,7 @@ func postgresInit() error {
 			year   VARCHAR(4),
 			path   VARCHAR(510) UNIQUE
 		)`, c.PostgresTableName)
-	_, err = dbp.Exec(createTable)
-	if err != nil {
+	if _, err = dbp.Exec(createTable); err != nil {
 		slog.Error("Failed to create metadata table.", "error", err)
 		return err
 	}
