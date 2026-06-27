@@ -1,6 +1,6 @@
 // db_redis.go
 // Rate limiting via Redis. Redis is optional.
-// If unavailable, rate limiting is skipped (use external tools like Caddy).
+// If unavailable, rate limiting is skipped gracefully.
 
 package main
 
@@ -10,14 +10,18 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var ctx           = context.Background()
-var dbr           = RedisClient{}
-var redisAvailable = false
+var ctx = context.Background()
+var dbr = RedisClient{}
+
+// redisAvailable is written once in redisInit and read concurrently from
+// HTTP handlers — must be atomic to avoid a data race.
+var redisAvailable atomic.Bool
 
 type RedisClient struct {
 	RateLimitRequest *redis.Client
@@ -31,7 +35,7 @@ func redisInit() {
 		DB:       c.RedisDB,
 	})
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		slog.Warn("Redis unavailable. Rate limiting disabled. Use Caddy rate_limit if needed.", "error", err)
+		slog.Warn("Redis unavailable. Rate limiting disabled.", "error", err)
 		return
 	}
 	dbr.RateLimitRequest = rdb
@@ -40,13 +44,13 @@ func redisInit() {
 		Password: c.RedisPassword,
 		DB:       c.RedisDB + 1, // art uses next DB index
 	})
-	redisAvailable = true
+	redisAvailable.Store(true)
 	slog.Info("Redis connected.", "addr", c.RedisAddress+c.RedisPort, "db", c.RedisDB)
 }
 
 func rateLimitRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable {
+		if !redisAvailable.Load() {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -72,7 +76,7 @@ func rateLimitRequest(next http.Handler) http.Handler {
 
 func rateLimitArt(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable {
+		if !redisAvailable.Load() {
 			next.ServeHTTP(w, r)
 			return
 		}
