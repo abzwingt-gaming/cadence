@@ -6,6 +6,7 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 
 	_ "modernc.org/sqlite"
@@ -15,13 +16,15 @@ var dbs *sql.DB
 
 func sqliteInit() error {
 	var err error
-	dbs, err = sql.Open("sqlite", c.SQLitePath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", c.SQLitePath)
+	slog.Info("Opening SQLite.", "path", c.SQLitePath)
+	dbs, err = sql.Open("sqlite", dsn)
 	if err != nil {
-		slog.Error("Couldn't open SQLite.", "path", c.SQLitePath, "error", err)
+		slog.Error("Cannot open SQLite.", "path", c.SQLitePath, "error", err)
 		return err
 	}
 	if err = dbs.Ping(); err != nil {
-		slog.Error("Couldn't ping SQLite.", "error", err)
+		slog.Error("Cannot ping SQLite.", "path", c.SQLitePath, "error", err)
 		return err
 	}
 	_, err = dbs.Exec(`
@@ -51,10 +54,14 @@ func sqliteUpsert(title, album, artist, genre, year, path string) error {
 		  SET title=excluded.title, album=excluded.album,
 		      artist=excluded.artist, genre=excluded.genre, year=excluded.year`,
 		title, album, artist, genre, year, path)
+	if err != nil {
+		slog.Warn("SQLite upsert failed.", "path", path, "error", err)
+	}
 	return err
 }
 
 func sqliteSearchByQuery(query string) ([]SongData, error) {
+	slog.Debug("sqliteSearchByQuery.", "query", query)
 	rows, err := dbs.Query(`
 		SELECT id, artist, title, album, genre, year FROM metadata
 		WHERE artist LIKE ? OR title LIKE ?
@@ -64,32 +71,25 @@ func sqliteSearchByQuery(query string) ([]SongData, error) {
 		LIMIT 200`,
 		"%"+query+"%", "%"+query+"%", query+"%", query+"%")
 	if err != nil {
+		slog.Error("sqliteSearchByQuery failed.", "query", query, "error", err)
 		return nil, err
 	}
 	defer rows.Close()
-	return scanSongRows(rows)
+	return scanSongs(rows)
 }
 
+// sqliteSearchByTitleArtist uses case-insensitive LIKE for parity with
+// the Postgres ILIKE implementation.
 func sqliteSearchByTitleArtist(title, artist string) ([]SongData, error) {
+	slog.Debug("sqliteSearchByTitleArtist.", "title", title, "artist", artist)
 	rows, err := dbs.Query(
-		`SELECT id, artist, title, album, genre, year FROM metadata WHERE title=? AND artist=? LIMIT 5`,
+		`SELECT id, artist, title, album, genre, year FROM metadata
+		 WHERE title LIKE ? AND artist LIKE ? LIMIT 5`,
 		title, artist)
 	if err != nil {
+		slog.Error("sqliteSearchByTitleArtist failed.", "title", title, "artist", artist, "error", err)
 		return nil, err
 	}
 	defer rows.Close()
-	return scanSongRows(rows)
-}
-
-func scanSongRows(rows *sql.Rows) ([]SongData, error) {
-	var results []SongData
-	for rows.Next() {
-		var s SongData
-		if err := rows.Scan(&s.ID, &s.Artist, &s.Title, &s.Album, &s.Genre, &s.Year); err != nil {
-			slog.Warn("Row scan error, skipping.", "error", err)
-			continue
-		}
-		results = append(results, s)
-	}
-	return results, rows.Err()
+	return scanSongs(rows)
 }
