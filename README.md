@@ -1,52 +1,90 @@
-## 📻 About
+# Cadence — Homelab Fork
 
-**Cadence** (or *CadenceRadio*) is an all-in-one internet radio suite. 
+Self-hosted web radio. Fork of [kenellorando/cadence](https://github.com/kenellorando/cadence), hardened for homelab use.
 
-The project ships *Icecast* and *Liquidsoap* working out-of-the-box, made complete by a *Cadence API* providing song request, library search, album artwork, and real-time stream information in a browser UI.
+## What's different from upstream
 
-**See a live demo on [cadenceradio.com](https://cadenceradio.com/)!**
+| Feature | Upstream | This fork |
+|---|---|---|
+| DB | Postgres only | Postgres **or** SQLite (pure Go) |
+| Redis | Required | Optional (graceful skip) |
+| Redis auth | No | Password + DB index |
+| Music scan | Single-threaded | Parallel workers (`CSERVER_SCAN_WORKERS`) |
+| Bad/empty tags | Crash / skip | Filename fallback, always inserts |
+| Audio formats | mp3 flac ogg | + m4a opus wav aac |
+| Icecast URL | One var (public+internal mixed) | Internal status URL + public stream URL separate |
+| Album art | Re-reads disk every request | In-memory cache, cleared on track change |
+| Frontend | jQuery + Bulma | Vanilla JS + NES.css + dark theme |
+| CSS customisation | Rebuild required | Mount `custom.css` volume |
+| Healthcheck | `/ready` only | `/healthz` with DB + Icecast + Redis status |
+| Compose | One profile | Profiles: default / `postgres` / `redis` |
+| Proxy config | nginx example | Caddy example (no snippets) |
+| Install | Interactive shell | Env-driven, sets up profiles |
+| CI | None | Build + lint on push/PR + release on tags |
+| Docker image | Manual build | Published to `ghcr.io` on tag |
 
-<img src="https://user-images.githubusercontent.com/17265041/219263637-6971ce33-209a-4eb5-b67e-547f271dc3c8.png" width="600" >
-
-## 🏃 Get Started
-
-An interactive installation script is provided. Users familiar with Docker can be up and running in ~5 minutes.
-
-### Server Preparation
-
-- [Docker Engine](https://docs.docker.com/engine/install/) and [Docker Compose V2](https://docs.docker.com/compose/install/) are installed.
-- You have some music files (e.g. `.mp3`, `.flac`) with title and artist metadata.
-
-### Installation
-
-Clone the Cadence repository to your server, then run the following:
+## Quick start
 
 ```bash
-$ chmod +x ./install.sh
-$ ./install.sh
+git clone https://github.com/abzwingt-gaming/cadence
+cd cadence
+bash install.sh
 ```
 
-You will be prompted to provide an absolute path to a directory containing music, a stream hostname, a rate limit timeout, a service password, and optional reverse proxy configuration. If you need help figuring out what values to use, refer to the [Installation Guide](https://github.com/kenellorando/cadence/wiki/Installation#interactive-prompt-guide). 
+Or manually:
 
-Your radio stack will automatically launch and Cadence's web UI will become accessible at `localhost:8080`.
+```bash
+cp config/cadence.env.example config/cadence.env
+# Edit config/cadence.env
+docker compose up -d
+```
 
-After initial installation, simply run `docker compose pull` to check for container updates, then `docker compose up` to start your station again. Run `./install.sh` again at any time to reconfigure. If you make changes to code locally, run `docker compose up --build` to build and run.
+For Postgres + Redis:
+```bash
+docker compose --profile postgres --profile redis up -d
+```
 
-## 🔬 Technical Details
+## Configuration
 
-### Architecture
-<details>
-<summary><i>Basic Architecture</i></summary>
+All config in `config/cadence.env`. Key variables:
 
-<img src="https://user-images.githubusercontent.com/17265041/228726513-e71775c4-dce4-4ef3-b4c2-1bbd37999769.png" width="800" >
+```env
+# DB backend
+CSERVER_DB_BACKEND=sqlite          # or postgres
+CSERVER_SQLITE_PATH=/data/cadence.db
 
-</details>
+# Internal Icecast URL (Docker only, never sent to browser)
+CSERVER_ICECAST_STATUS_URL=http://icecast2:8000
 
-If you're interested in implementation details, [this blog post](https://cuddle.fish/posts/2022-11-08-cadence) does a dive into how a basic *Icecast/Liquidsoap* web radio works and the value Cadence provides.
+# Public stream URL sent to browser
+CSERVER_PUBLIC_STREAM_URL=https://radio.example.com/cadence1
 
-### API Reference for Custom Clients
-Cadence's GitHub Wiki also hosts an [API Reference](https://github.com/kenellorando/cadence/wiki/API-Reference) with complete request/response details, useful for anyone developing custom scripts or clients for their station.
+# Redis (optional)
+CSERVER_REDISPASSWORD=secret
+CSERVER_REDISDB=0
 
-### Discord Server Integration
-Cadence installations can be directly integrated with Discord Servers using [CadenceBot](https://github.com/za419/CadenceBot). CadenceBot allows you to control your station through Discord chat and listen to the radio in voice channels! 
-You can quickly demo a CadenceBot by [adding it to your Discord server](https://discord.com/api/oauth2/authorize?client_id=372999377569972224&permissions=274881252352&scope=bot).
+# Scan workers
+CSERVER_SCAN_WORKERS=4
+```
+
+See `config/cadence.env.example` for all options.
+
+## Custom CSS
+
+Edit `src/server/public/css/custom.css` — it is mounted into the container, no rebuild needed.
+
+## Caddy
+
+See `config/Caddyfile.example`.
+
+## Releasing
+
+```bash
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+CI builds multi-arch image and pushes to `ghcr.io/abzwingt-gaming/cadence:v1.0.0` + creates a GitHub Release.
+
+## Improvements backlog
+
+See [IMPROVEMENTS.md](./IMPROVEMENTS.md).
