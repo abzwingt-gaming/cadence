@@ -1,81 +1,61 @@
-// api.go
-// API functions.
+// api.go - HTTP handlers.
 
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/dhowden/tag"
 )
 
-// POST /api/search
+// rescanRunning prevents overlapping rescans triggered by /api/admin/rescan,
+// SIGHUP, or the filesystem watcher.
+var rescanRunning atomic.Bool
+
 func Search() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		slog.Debug(fmt.Sprintf("Search request from client %s.", r.RemoteAddr), "func", "Search")
-		type Search struct {
+		var req struct {
 			Query string `json:"search"`
 		}
-		var search Search
-		decoder := json.NewDecoder(r.Body)
-		err := decoder.Decode(&search)
-		if err != nil {
-			slog.Error("Unable to decode search body.", "func", "Search", "error", err)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		queryResults, err := searchByQuery(search.Query)
+		results, err := searchByQuery(req.Query)
 		if err != nil {
-			slog.Error("Unable to execute search by query.", "func", "Search", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		jsonMarshal, err := json.Marshal(queryResults)
-		if err != nil {
-			slog.Error("Failed to marshal results from the search.", "func", "Search", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(results)
 	}
 }
 
-// POST /api/request/id
 func RequestID() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		slog.Info(fmt.Sprintf("Request-by-ID by client %s.", r.RemoteAddr), "func", "Request")
-		type Request struct {
-			ID string `json:"ID"`
-		}
-		var request Request
-		decoder := json.NewDecoder(r.Body)
-		err := decoder.Decode(&request)
-		if err != nil {
-			slog.Error("Unable to decode request.", "func", "RequestID", "error", err)
+		var req struct{ ID string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		reqID, err := strconv.Atoi(request.ID)
+		id, err := strconv.Atoi(req.ID)
 		if err != nil {
-			slog.Error("Unable to convert request ID to integer.", "func", "RequestID", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		path, err := getPathById(reqID)
+		path, err := getPathById(id)
 		if err != nil {
-			slog.Error("Unable to find file path by song ID.", "func", "RequestID", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, err = liquidsoapRequest(path)
-		if err != nil {
-			slog.Error("Unable to submit song request.", "func", "RequestID", "error", err)
+		if _, err = liquidsoapRequest(path); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -83,39 +63,24 @@ func RequestID() http.HandlerFunc {
 	}
 }
 
-// POST /api/request/bestmatch
 func RequestBestMatch() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		type RequestBestMatch struct {
-			Query string `json:"Search"`
-		}
-		var rbm RequestBestMatch
-		decoder := json.NewDecoder(r.Body)
-		err := decoder.Decode(&rbm)
-		if err != nil {
-			slog.Error("Unable to decode request body.", "func", "RequestBestMatch", "error", err)
+		var req struct{ Search string }
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-		queryResults, err := searchByQuery(rbm.Query)
-		if err != nil {
-			slog.Error("Unable to search by query.", "func", "RequestBestMatch", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if len(queryResults) == 0 {
+		results, err := searchByQuery(req.Search)
+		if err != nil || len(results) == 0 {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		path, err := getPathById(queryResults[0].ID)
+		path, err := getPathById(results[0].ID)
 		if err != nil {
-			slog.Error("Unable to find file path by song ID.", "func", "RequestBestMatch", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		_, err = liquidsoapRequest(path)
-		if err != nil {
-			slog.Error("Unable to submit song request.", "func", "RequestBestMatch", "error", err)
+		if _, err = liquidsoapRequest(path); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -123,205 +88,196 @@ func RequestBestMatch() http.HandlerFunc {
 	}
 }
 
-// GET /api/nowplaying/metadata
 func NowPlayingMetadata() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		queryResults, err := searchByTitleArtist(now.Song.Title, now.Song.Artist)
+		n := NowSnapshot()
+		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
 		if err != nil {
-			slog.Error("Unable to search by title and artist.", "func", "NowPlayingMetadata", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if len(queryResults) < 1 {
-			slog.Warn("Currently playing song not found in database.", "func", "NowPlayingMetadata")
+		if len(results) == 0 {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		jsonMarshal, err := json.Marshal(queryResults[0])
-		if err != nil {
-			slog.Error("Failed to marshal results.", "func", "NowPlayingMetadata", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(results[0])
 	}
 }
 
-// GET /api/nowplaying/albumart
 func NowPlayingAlbumArt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		queryResults, err := searchByTitleArtist(now.Song.Title, now.Song.Artist)
-		if err != nil {
-			slog.Error("Unable to search by title and artist.", "func", "NowPlayingAlbumArt", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if len(queryResults) < 1 {
-			slog.Warn("Currently playing song not found in database.", "func", "NowPlayingAlbumArt")
+		n := NowSnapshot()
+		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
+		if err != nil || len(results) == 0 {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		path, err := getPathById(queryResults[0].ID)
-		if err != nil {
-			slog.Error("Unable to find file path by song ID.", "func", "NowPlayingAlbumArt", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			slog.Error("Unable to open file for album art extraction.", "func", "NowPlayingAlbumArt", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		tags, err := tag.ReadFrom(file)
-		if err != nil {
-			slog.Warn("Unable to read tags on file for art extraction.", "func", "NowPlayingAlbumArt", "error", err)
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		if tags.Picture() == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		type SongData struct {
-			Picture []byte
-		}
-		result := SongData{Picture: tags.Picture().Data}
-		jsonMarshal, err := json.Marshal(result)
-		if err != nil {
-			slog.Error("Failed to marshal art data.", "func", "NowPlayingAlbumArt", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
-	}
-}
+		song := results[0]
+		cacheKey := fmt.Sprintf("%d", song.ID)
 
-// GET /api/history
-func History() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		jsonMarshal, err := json.Marshal(history)
-		if err != nil {
-			slog.Error("Failed to marshal play history.", "func", "History", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
+		if cached, ok := artCache.Load(cacheKey); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(cached.([]byte))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
-	}
-}
 
-// GET /api/streamurl
-// Returns the public-facing stream URL (CSERVER_STREAMURL).
-// This is what the browser audio element should point to.
-// Separate from /api/listenurl which reflects internal Icecast host.
-func StreamURL() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		type StreamURL struct {
-			StreamURL string
+		path, err := getPathById(song.ID)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
 		}
-		url := c.StreamURL
-		if url == "" {
-			// Fallback: build from internal Icecast data (original behavior)
-			if now.Host != "" && now.Host != "-" {
-				url = "http://" + now.Host + now.Mountpoint
+
+		// 1. Try embedded tags — scoped in closure so defer fires immediately.
+		var encoded string
+		func() {
+			f, ferr := os.Open(path)
+			if ferr != nil {
+				return
+			}
+			defer f.Close()
+			tags, terr := tag.ReadFrom(f)
+			if terr == nil && tags.Picture() != nil {
+				encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
+			}
+		}()
+
+		// 2. Fallback: cover.jpg / folder.jpg in same directory.
+		if encoded == "" {
+			if fallbackPath := ArtworkPath(path); fallbackPath != "" {
+				if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
+					encoded = base64.StdEncoding.EncodeToString(data)
+					slog.Debug("Artwork from fallback file.", "path", fallbackPath)
+				}
 			}
 		}
-		jsonMarshal, err := json.Marshal(StreamURL{StreamURL: url})
-		if err != nil {
-			slog.Error("Failed to marshal stream URL.", "func", "StreamURL", "error", err)
+
+		if encoded == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		type ArtResponse struct {
+			Picture string `json:"Picture"`
+		}
+		jsonBytes, merr := json.Marshal(ArtResponse{Picture: encoded})
+		if merr != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
+		artCache.Store(cacheKey, jsonBytes)
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		w.Write(jsonBytes)
 	}
 }
 
-// GET /api/listenurl
+func History() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		historyMu.Lock()
+		snap := make([]playRecord, len(history))
+		copy(snap, history)
+		historyMu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(snap)
+	}
+}
+
 func ListenURL() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		type ListenURL struct {
-			ListenURL string
-		}
-		listenurl := ListenURL{ListenURL: now.Host + "/" + now.Mountpoint}
-		jsonMarshal, err := json.Marshal(listenurl)
-		if err != nil {
-			slog.Error("Failed to marshal listen URL.", "func", "ListenURL", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+		n := NowSnapshot()
+		publicURL := c.PublicStreamURL
+		if publicURL == "" {
+			publicURL = n.Host + "/" + n.Mountpoint
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(struct{ ListenURL string }{ListenURL: publicURL})
 	}
 }
 
-// GET /api/listeners
 func Listeners() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		type Listeners struct {
-			Listeners int
-		}
-		jsonMarshal, err := json.Marshal(Listeners{Listeners: int(now.Listeners)})
-		if err != nil {
-			slog.Error("Failed to marshal listeners.", "func", "Listeners", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+		n := NowSnapshot()
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(struct{ Listeners int }{Listeners: int(n.Listeners)})
 	}
 }
 
-// GET /api/bitrate
 func Bitrate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		type Bitrate struct {
-			Bitrate int
-		}
-		jsonMarshal, err := json.Marshal(Bitrate{Bitrate: int(now.Bitrate)})
-		if err != nil {
-			slog.Error("Failed to marshal bitrate.", "func", "Bitrate", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
+		n := NowSnapshot()
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(struct{ Bitrate int }{Bitrate: int(n.Bitrate)})
 	}
 }
 
-// GET /api/version
 func Version() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		type Version struct {
-			Version string
-		}
-		jsonMarshal, err := json.Marshal(Version{Version: c.Version})
-		if err != nil {
-			slog.Error("Failed to marshal version.", "func", "Version", "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(jsonMarshal)
+		json.NewEncoder(w).Encode(struct{ Version string }{Version: c.Version})
 	}
 }
 
-// GET /ready
-func Ready() http.HandlerFunc {
+// AdminRescan triggers a DB rescan. Only registered when CSERVER_DEVMODE=true.
+// Returns 202 immediately; 409 if a rescan is already in progress.
+func AdminRescan() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if !rescanRunning.CompareAndSwap(false, true) {
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte("rescan already running"))
+			return
+		}
+		go func() {
+			defer rescanRunning.Store(false)
+			slog.Info("Manual rescan triggered via /api/admin/rescan.")
+			resetCleanupRe()
+			if err := dbPopulate(); err != nil {
+				slog.Error("Rescan failed.", "error", err)
+			}
+		}()
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
+func Readyz() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if dbActive == nil || dbActive.Ping() != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
-// GET /api/dev/skip
+func Healthz() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		dbOK := dbActive != nil && dbActive.Ping() == nil
+		n := NowSnapshot()
+		icecastOK := n.Song.Title != "-" && n.Song.Title != ""
+		status := "ok"
+		code := http.StatusOK
+		if !dbOK || !icecastOK {
+			status = "degraded"
+			code = http.StatusServiceUnavailable
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  status,
+			"db":      dbOK,
+			"icecast": icecastOK,
+			"redis":   redisAvailable.Load(),
+			"version": c.Version,
+		})
+	}
+}
+
 func DevSkip() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		_, err := liquidsoapSkip()
-		if err != nil {
-			slog.Error("Unable to skip the playing song.", "func", "DevSkip", "error", err)
+		if _, err := liquidsoapSkip(); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
