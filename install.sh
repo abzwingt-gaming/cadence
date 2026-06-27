@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# install.sh — Cadence homelab installer
+# Usage: bash install.sh
 set -euo pipefail
 
 COLOR_GREEN='\033[0;32m'
@@ -13,45 +15,46 @@ err()   { echo -e "${COLOR_RED}[error]${COLOR_RESET}  $*" >&2; }
 info "Cadence Homelab Installer"
 echo
 
-# --- Checks ---
-command -v docker  >/dev/null 2>&1 || { err "Docker not found. Install Docker first."; exit 1; }
-command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1 || \
-  { err "Docker Compose not found."; exit 1; }
+# -----------------------------------------------------------------------
+# Dependency checks
+# -----------------------------------------------------------------------
+command -v docker >/dev/null 2>&1 || { err "Docker not found. Install Docker first."; exit 1; }
+docker compose version >/dev/null 2>&1 || \
+  { err "Docker Compose v2 not found. Install the 'compose' plugin."; exit 1; }
 
-# --- Config files ---
-if [ ! -f config/cadence.env ]; then
-  cp config/cadence.env.example config/cadence.env
-  info "Created config/cadence.env from example."
-else
-  info "config/cadence.env already exists, skipping."
-fi
-
-for f in icecast.xml liquidsoap.liq; do
+# -----------------------------------------------------------------------
+# Bootstrap config files from examples
+# -----------------------------------------------------------------------
+for f in cadence.env icecast.xml liquidsoap.liq Caddyfile; do
   if [ ! -f "config/$f" ]; then
     cp "config/$f.example" "config/$f"
     info "Created config/$f from example."
+  else
+    info "config/$f already exists, skipping."
   fi
 done
 
-if [ ! -f config/Caddyfile ]; then
-  cp config/Caddyfile.example config/Caddyfile
-  info "Created config/Caddyfile from example."
-fi
-
-# Ensure data dir exists for SQLite
+# Ensure data dir exists for SQLite / Postgres
 mkdir -p data
 
-# --- Interactive setup ---
+# -----------------------------------------------------------------------
+# Interactive setup
+# -----------------------------------------------------------------------
 echo
 info "=== Quick Setup ==="
+echo
 
 read -rp "Music directory path [/music]: " MUSIC_DIR
 MUSIC_DIR=${MUSIC_DIR:-/music}
 
+if [ ! -d "$MUSIC_DIR" ]; then
+  warn "Directory '$MUSIC_DIR' does not exist. Cadence will warn on startup."
+fi
+
 echo
 echo "Database backend:"
-echo "  1) sqlite  - lightweight, no extra container (recommended for homelab)"
-echo "  2) postgres - full fuzzy search, requires more RAM"
+echo "  1) sqlite   - lightweight, single file, recommended for homelab"
+echo "  2) postgres - full fuzzy search via levenshtein, requires more RAM"
 read -rp "Choice [1]: " DB_CHOICE
 DB_CHOICE=${DB_CHOICE:-1}
 
@@ -64,59 +67,114 @@ PROFILES=""
 PG_PASS=""
 if [ "$DB_BACKEND" = "postgres" ]; then
   read -rsp "Postgres password: " PG_PASS; echo
+  [ -z "$PG_PASS" ] && { err "Postgres password cannot be empty."; exit 1; }
   PROFILES="--profile postgres"
 fi
 
 echo
 read -rp "Enable Redis rate limiting? (y/N): " USE_REDIS
 USE_REDIS=${USE_REDIS:-n}
+REDIS_PASS=""
 if [[ "$USE_REDIS" =~ ^[Yy]$ ]]; then
   read -rsp "Redis password (leave blank for none): " REDIS_PASS; echo
-  PROFILES="$PROFILES --profile redis"
-  # Write REDIS_PASSWORD to env if set
-  if [ -n "${REDIS_PASS:-}" ]; then
-    echo "REDIS_PASSWORD=${REDIS_PASS}" >> config/cadence.env
-    sed -i "s|# CSERVER_REDISPASSWORD=|CSERVER_REDISPASSWORD=${REDIS_PASS}|" config/cadence.env
-  fi
+  PROFILES="${PROFILES} --profile redis"
 fi
 
 echo
-read -rp "Public stream URL (e.g. https://radio.example.com/cadence1) [leave blank to skip]: " PUBLIC_STREAM
+read -rp "Public stream URL (e.g. https://radio.example.com/cadence1) [leave blank to auto]: " PUBLIC_STREAM
 PUBLIC_STREAM=${PUBLIC_STREAM:-}
 
-# --- Write config ---
-sed -i "s|CSERVER_MUSIC_DIR=.*|CSERVER_MUSIC_DIR=${MUSIC_DIR}|"     config/cadence.env
-sed -i "s|CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND}|" config/cadence.env
-echo "MUSIC_DIR=${MUSIC_DIR}" >> config/cadence.env
+echo
+read -rp "Log level (debug/info/warn/error) [info]: " LOG_LEVEL
+LOG_LEVEL=${LOG_LEVEL:-info}
+
+# -----------------------------------------------------------------------
+# Write config/cadence.env
+# -----------------------------------------------------------------------
+sed_inplace() {
+  # Portable sed -i for both GNU and BSD
+  sed -i.bak "$1" "$2" && rm -f "$2.bak"
+}
+
+sed_inplace "s|^CSERVER_MUSIC_DIR=.*|CSERVER_MUSIC_DIR=${MUSIC_DIR}|"     config/cadence.env
+sed_inplace "s|^CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND}|"  config/cadence.env
+sed_inplace "s|^CSERVER_LOGLEVEL=.*|CSERVER_LOGLEVEL=${LOG_LEVEL}|"        config/cadence.env
 
 if [ -n "$PG_PASS" ]; then
-  sed -i "s|# POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"   config/cadence.env
-fi
-if [ -n "$PUBLIC_STREAM" ]; then
-  sed -i "s|CSERVER_PUBLIC_STREAM_URL=.*|CSERVER_PUBLIC_STREAM_URL=${PUBLIC_STREAM}|" config/cadence.env
+  sed_inplace "s|^# POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"    config/cadence.env
 fi
 
-# --- Build & start ---
+if [ -n "$REDIS_PASS" ]; then
+  sed_inplace "s|^# CSERVER_REDISPASSWORD=.*|CSERVER_REDISPASSWORD=${REDIS_PASS}|" config/cadence.env
+fi
+
+if [ -n "$PUBLIC_STREAM" ]; then
+  sed_inplace "s|^CSERVER_PUBLIC_STREAM_URL=.*|CSERVER_PUBLIC_STREAM_URL=${PUBLIC_STREAM}|" config/cadence.env
+fi
+
+# Write MUSIC_DIR and REDIS_PASSWORD to .env (for docker compose variable substitution)
+# This is SEPARATE from cadence.env — compose reads .env for ${VAR} interpolation
+cat > .env <<EOF
+# Auto-generated by install.sh — do not edit manually
+MUSIC_DIR=${MUSIC_DIR}
+REDIS_PASSWORD=${REDIS_PASS}
+EOF
+info "Written .env for docker compose variable substitution."
+
+# -----------------------------------------------------------------------
+# Update icecast/liquidsoap configs
+# -----------------------------------------------------------------------
+if [ "$DB_BACKEND" != "postgres" ]; then
+  # Remind user to set passwords in icecast.xml and liquidsoap.liq
+  warn "Remember to replace CADENCE_PASS_EXAMPLE in config/icecast.xml and config/liquidsoap.liq"
+  warn "and CADENCE_PATH_EXAMPLE in config/liquidsoap.liq with your actual music path: ${MUSIC_DIR}"
+fi
+
+# Patch CADENCE_PATH_EXAMPLE in liquidsoap.liq with the real music dir
+sed_inplace "s|CADENCE_PATH_EXAMPLE|${MUSIC_DIR}|g" config/liquidsoap.liq
+info "Patched music path in config/liquidsoap.liq."
+
+# -----------------------------------------------------------------------
+# Build & start
+# -----------------------------------------------------------------------
 echo
-info "Building images..."
+info "Building Docker images..."
 docker compose build
 
-info "Starting Cadence ($DB_BACKEND${PROFILES:+ + ${PROFILES// --profile /+}})..."
+PROFILE_DISPLAY=${PROFILES:-none}
+info "Starting Cadence (db=${DB_BACKEND}, profiles=${PROFILE_DISPLAY})..."
 # shellcheck disable=SC2086
-docker compose $PROFILES up -d
+docker compose ${PROFILES} up -d
 
+# -----------------------------------------------------------------------
+# Health check
+# -----------------------------------------------------------------------
 echo
-info "Done! Cadence should be available at http://localhost:8080"
+info "Waiting for cadence to start..."
+sleep 5
 if command -v curl >/dev/null 2>&1; then
-  sleep 3
-  if curl -sf http://localhost:8080/healthz | grep -q 'ok'; then
-    info "Health check passed."
+  HEALTH=$(curl -sf http://localhost:8080/readyz -o /dev/null -w "%{http_code}" || true)
+  if [ "$HEALTH" = "200" ]; then
+    info "Health check passed (readyz=200)."
   else
-    warn "Health check returned degraded. Check: docker compose logs cadence"
+    warn "Health check returned HTTP ${HEALTH:-timeout}."
+    warn "Icecast may still be starting. Check: docker compose logs icecast2 cadence"
   fi
 fi
+
+# -----------------------------------------------------------------------
+# Summary
+# -----------------------------------------------------------------------
 echo
-info "Config:     config/cadence.env"
-info "Caddy:      config/Caddyfile.example"
-info "Custom CSS: src/server/public/css/custom.css (mounted, edit without rebuild)"
-info "Logs:       docker compose logs -f cadence"
+info "===== Cadence is running ====="
+info "Frontend:    http://localhost:8080"
+info "Icecast:     http://localhost:8000"
+info "Config:      config/cadence.env"
+info "Caddy:       config/Caddyfile.example → config/Caddyfile"
+info "Custom CSS:  src/server/public/css/custom.css"
+info "Logs:        docker compose logs -f cadence"
+echo
+info "Hot-reload config without restart:"
+info "  docker kill -s HUP cadence"
+echo
+info "To stop: docker compose down"

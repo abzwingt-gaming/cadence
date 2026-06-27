@@ -1,35 +1,54 @@
 <icecast>
     <location>Internet</location>
-    <admin>Source: Cadence Radio (github.com/kenellorando/cadence)</admin>
-	
+    <admin>Source: Cadence Radio</admin>
+
     <limits>
-	<clients>100</clients>
+        <clients>100</clients>
         <sources>2</sources>
         <threadpool>5</threadpool>
-        <queue-size>1048576</queue-size>
+        <queue-size>524288</queue-size>
         <client-timeout>30</client-timeout>
         <header-timeout>15</header-timeout>
-        <source-timeout>10</source-timeout>\
-        <burst-on-connect>1</burst-on-connect>
+        <source-timeout>10</source-timeout>
+        <!-- burst-size: bytes sent immediately on connect for smooth start -->
+        <burst-size>65536</burst-size>
     </limits>
 
     <authentication>
         <!-- Sources log in with username 'source' -->
         <source-password>CADENCE_PASS_EXAMPLE</source-password>
-        <!-- Relays log in username 'relay' -->
+        <!-- Relays log in with username 'relay' -->
         <relay-password>CADENCE_PASS_EXAMPLE</relay-password>
         <!-- Admin logs in with the username given below -->
         <admin-user>admin</admin-user>
         <admin-password>CADENCE_PASS_EXAMPLE</admin-password>
     </authentication>
 
+    <!-- Public hostname shown in stream metadata -->
     <hostname>CADENCE_STREAM_HOST_EXAMPLE</hostname>
 
     <listen-socket>
         <port>8000</port>
     </listen-socket>
 
+    <!--
+        Mount point configuration.
+        Restricts who can push to /cadence1 and sets stream metadata.
+    -->
+    <mount type="normal">
+        <mount-name>/cadence1</mount-name>
+        <!-- Only liquidsoap source password is accepted on this mount -->
+        <password>CADENCE_PASS_EXAMPLE</password>
+        <max-listeners>100</max-listeners>
+        <dump-file>/var/log/icecast/cadence1-dump.mp3</dump-file>
+        <stream-name>Cadence Radio</stream-name>
+        <stream-description>Cadence Radio Stream</stream-description>
+        <stream-url>http://CADENCE_STREAM_HOST_EXAMPLE</stream-url>
+        <genre>Various</genre>
+        <public>0</public>
+    </mount>
 
+    <!-- Disable Icecast built-in file serving; Caddy handles static files -->
     <fileserve>0</fileserve>
 
     <paths>
@@ -37,6 +56,7 @@
         <logdir>/var/log/icecast</logdir>
         <webroot>/usr/share/icecast/web</webroot>
         <adminroot>/usr/share/icecast/admin</adminroot>
+        <!-- Redirect bare / to status page -->
         <alias source="/" destination="/status.xsl"/>
     </paths>
 
@@ -44,8 +64,10 @@
         <accesslog>access.log</accesslog>
         <errorlog>error.log</errorlog>
         <playlistlog>playlist.log</playlistlog>
-      	<loglevel>3</loglevel> <!-- 4 Debug, 3 Info, 2 Warn, 1 Error -->
-      	<logsize>10000</logsize>
+        <!-- 4=Debug 3=Info 2=Warn 1=Error -->
+        <loglevel>3</loglevel>
+        <!-- Max log size in KB before rotation -->
+        <logsize>10000</logsize>
     </logging>
 
     <security>

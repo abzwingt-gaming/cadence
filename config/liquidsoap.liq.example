@@ -1,17 +1,97 @@
-# Documentation for adding sources, live mounts, jingles, etc.
-# http://savonet.sourceforge.net/doc-svn/complete_case.html
+# liquidsoap.liq.example — Liquidsoap 2.x configuration for Cadence
+# Docs: https://www.liquidsoap.info/doc-2.2.x/
+#
+# Environment substitution is NOT supported in .liq files.
+# Edit CADENCE_PATH_EXAMPLE and CADENCE_PASS_EXAMPLE before use.
 
-set("log.file.path", "/var/log/liquidsoap/liquidsoap.log")
-set("log.stdout", true)
-set("server.telnet", true)
-set("server.telnet.bind_addr", "0.0.0.0")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+settings.log.file.set(true)
+settings.log.file.path.set("/var/log/liquidsoap/liquidsoap.log")
+settings.log.stdout.set(true)
+settings.log.level.set(3)  # 1=Error 2=Warning 3=Info 4=Debug
 
-# 1. Lowest priority: play all music in the target directory at random.
-default = mksafe(playlist(mode="randomize", "CADENCE_PATH_EXAMPLE"))
-# 2. Next priority: play user requests first if there are any in the queue.
-radio = fallback([ request.queue(id="request"), default])
-# 3. Next priority: play live input stream if one is connected. 
-full = fallback(track_sensitive=false, [input.http("http://localhost:8000/live.ogg"), radio])
+# ---------------------------------------------------------------------------
+# Telnet control server (used by cadence when LIQUIDSOAP_MODE=telnet or auto)
+# Port must match CSERVER_LIQUIDSOAPPORT in cadence.env
+# ---------------------------------------------------------------------------
+settings.server.telnet.set(true)
+settings.server.telnet.bind_addr.set("0.0.0.0")
+settings.server.telnet.port.set(1234)
 
-# Output the full stream in OGG
-output.icecast(%vorbis.cbr(bitrate=192), host="icecast2",port=8000,password="CADENCE_PASS_EXAMPLE", mount="cadence1",full)
+# ---------------------------------------------------------------------------
+# HTTP harbor (used by cadence when LIQUIDSOAP_MODE=http or auto)
+# Port must match CSERVER_LIQUIDSOAP_HTTP_PORT in cadence.env
+# ---------------------------------------------------------------------------
+settings.harbor.bind_addrs.set(["0.0.0.0"])
+settings.harbor.port.set(8001)
+
+# ---------------------------------------------------------------------------
+# Sources (priority lowest → highest)
+# ---------------------------------------------------------------------------
+
+# 1. Lowest: play all music at random from the music directory.
+#    Replace CADENCE_PATH_EXAMPLE with your actual music path.
+default = playlist(
+  mode="randomize",
+  reload_mode="watch",
+  "CADENCE_PATH_EXAMPLE"
+)
+
+# Safety wrapper: output silence if the playlist is empty.
+default = mksafe(default)
+
+# 2. User request queue — cadence pushes tracks here via /api/request.
+#    id must match the source id cadence calls: "cadence1"
+requests = request.queue(id="cadence1")
+
+# 3. Priority: requests override the random playlist.
+radio = fallback(
+  track_sensitive=true,
+  [requests, default]
+)
+
+# 4. Highest priority: live input stream.
+#    'icecast2' is the Docker service name; adjust if different.
+#    Disable to remove live input support.
+live = input.http(
+  id="live",
+  autostart=false,
+  "http://icecast2:8000/live.ogg"
+)
+full = fallback(
+  track_sensitive=false,
+  [live, radio]
+)
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+
+# OGG/Vorbis output (default)
+# Replace CADENCE_PASS_EXAMPLE with your Icecast source password.
+output.icecast(
+  %vorbis.cbr(bitrate=192),
+  host="icecast2",
+  port=8000,
+  password="CADENCE_PASS_EXAMPLE",
+  mount="cadence1",
+  name="Cadence Radio",
+  description="Cadence Radio Stream",
+  public=false,
+  full
+)
+
+# MP3 output (uncomment to add a parallel MP3 mount at /cadence1.mp3)
+# output.icecast(
+#   %mp3(bitrate=192),
+#   host="icecast2",
+#   port=8000,
+#   password="CADENCE_PASS_EXAMPLE",
+#   mount="cadence1.mp3",
+#   name="Cadence Radio (MP3)",
+#   description="Cadence Radio Stream",
+#   public=false,
+#   full
+# )

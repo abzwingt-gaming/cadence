@@ -1,19 +1,21 @@
-# Cadence homelab docker-compose
-# Profiles:
-#   postgres (default db)  - include: postgres service
-#   sqlite   (lightweight) - no postgres, uses local sqlite file
-#   redis                  - optional rate limiting
+# Cadence docker-compose
 #
-# Minimal start (SQLite, no Redis):
+# Profiles:
+#   (none)    — cadence + icecast + liquidsoap + SQLite  [recommended for homelab]
+#   postgres  — adds postgres service, set CSERVER_DB_BACKEND=postgres in cadence.env
+#   redis     — adds redis service for rate limiting
+#
+# Quick start (SQLite):
 #   docker compose up -d
 #
-# Full stack with Postgres + Redis:
+# Full stack:
 #   docker compose --profile postgres --profile redis up -d
 
 services:
 
   icecast2:
     build:
+      context: .
       dockerfile: ./src/icecast2.Dockerfile
     image: cadence_icecast2
     container_name: icecast2
@@ -25,20 +27,29 @@ services:
     networks:
       - services-net
       - stream-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/status-json.xsl"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   liquidsoap:
     build:
+      context: .
       dockerfile: ./src/liquidsoap.Dockerfile
     image: cadence_liquidsoap
     container_name: liquidsoap
     restart: unless-stopped
     volumes:
       - ./config/liquidsoap.liq:/etc/liquidsoap/cadence.liq:ro
-      - ${MUSIC_DIR}:${MUSIC_DIR}:ro
+      - ${MUSIC_DIR:-/music}:${MUSIC_DIR:-/music}:ro
     depends_on:
-      - icecast2
+      icecast2:
+        condition: service_healthy
     expose:
       - "1234"
+      - "8001"
     networks:
       - services-net
       - stream-net
@@ -55,19 +66,22 @@ services:
     env_file:
       - ./config/cadence.env
     volumes:
-      - ${MUSIC_DIR}:${MUSIC_DIR}:ro
-      - ./src/server/public/css/custom.css:/cadence/server/public/css/custom.css:ro
-      - ./data:/data  # sqlite db lives here
+      - ${MUSIC_DIR:-/music}:${MUSIC_DIR:-/music}:ro
+      - ./src/server/public/css/custom.css:/app/public/css/custom.css:ro
+      - ./data:/data
     depends_on:
-      - icecast2
-      - liquidsoap
+      icecast2:
+        condition: service_healthy
+      liquidsoap:
+        condition: service_started
     networks:
       - services-net
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 15s
 
   postgres:
     profiles: ["postgres"]
@@ -82,6 +96,11 @@ services:
       - ./data/postgres:/var/lib/postgresql/data
     networks:
       - services-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   redis:
     profiles: ["redis"]
@@ -97,6 +116,11 @@ services:
       - "6379"
     networks:
       - services-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
 networks:
   services-net:

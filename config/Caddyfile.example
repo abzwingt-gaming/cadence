@@ -1,32 +1,98 @@
-# Caddyfile.example - Cadence behind Caddy
-# Place in your main Caddyfile or import.
+# Caddyfile.example — Cadence behind Caddy reverse proxy
 # Replace radio.example.com with your domain.
+# For homelab with internal CA: replace with your .lan domain.
 
 radio.example.com {
     encode zstd gzip
 
+    # Security headers
     header {
         X-Frame-Options SAMEORIGIN
         X-Content-Type-Options nosniff
         X-Robots-Tag "noindex, nofollow"
-        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        Referrer-Policy "same-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
         -Server
     }
 
-    # Icecast audio stream - flush immediately for live streaming
-    handle /cadence1 {
-        reverse_proxy icecast2:8000 {
+    # SSE endpoint — must not be buffered, must not timeout
+    # X-Accel-Buffering disables nginx-style buffering in intermediate proxies
+    handle /api/radiodata/sse {
+        header Cache-Control no-cache
+        header X-Accel-Buffering no
+        reverse_proxy cadence:8080 {
             flush_interval -1
+            transport http {
+                # Keep SSE connection alive indefinitely
+                read_timeout 0
+            }
         }
     }
 
-    # Icecast status (optional, for external tools)
+    # Icecast audio stream — flush immediately, no timeout (live audio)
+    handle /cadence1 {
+        reverse_proxy icecast2:8000 {
+            flush_interval -1
+            transport http {
+                read_timeout 0
+            }
+        }
+    }
+
+    # Icecast MP3 mount (uncomment if you enabled MP3 output in liquidsoap)
+    # handle /cadence1.mp3 {
+    #     reverse_proxy icecast2:8000 {
+    #         flush_interval -1
+    #         transport http {
+    #             read_timeout 0
+    #         }
+    #     }
+    # }
+
+    # Icecast status API (used internally by cadence; expose only if needed)
     handle /status-json.xsl {
         reverse_proxy icecast2:8000
     }
 
-    # Cadence API + frontend
+    # Cadence API + frontend (all other paths)
     handle {
         reverse_proxy cadence:8080
     }
 }
+
+# -----------------------------------------------------------------------
+# Homelab LAN-only example (internal CA / mDNS / split-horizon DNS)
+# Uncomment and adjust if you use a .lan domain.
+# -----------------------------------------------------------------------
+# radio.lan.example.com {
+#     tls internal
+#
+#     encode zstd gzip
+#
+#     header {
+#         X-Frame-Options SAMEORIGIN
+#         X-Content-Type-Options nosniff
+#         -Server
+#     }
+#
+#     handle /api/radiodata/sse {
+#         header Cache-Control no-cache
+#         header X-Accel-Buffering no
+#         reverse_proxy cadence:8080 {
+#             flush_interval -1
+#             transport http { read_timeout 0 }
+#         }
+#     }
+#
+#     handle /cadence1 {
+#         reverse_proxy icecast2:8000 {
+#             flush_interval -1
+#             transport http { read_timeout 0 }
+#         }
+#     }
+#
+#     handle {
+#         reverse_proxy cadence:8080
+#     }
+# }
