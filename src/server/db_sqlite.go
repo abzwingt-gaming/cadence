@@ -16,13 +16,22 @@ var dbs *sql.DB
 
 func sqliteInit() error {
 	var err error
-	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", c.SQLitePath)
+	// WAL mode + 5 s busy timeout + normal sync for best write throughput.
+	// foreign_keys=on for referential safety.
+	dsn := fmt.Sprintf(
+		"%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(on)",
+		c.SQLitePath,
+	)
 	slog.Info("Opening SQLite.", "path", c.SQLitePath)
 	dbs, err = sql.Open("sqlite", dsn)
 	if err != nil {
 		slog.Error("Cannot open SQLite.", "path", c.SQLitePath, "error", err)
 		return err
 	}
+	// SQLite supports only one writer at a time. Limiting the pool to a
+	// single connection eliminates SQLITE_BUSY races under concurrent
+	// scan + query load even when busy_timeout is set.
+	dbs.SetMaxOpenConns(1)
 	if err = dbs.Ping(); err != nil {
 		slog.Error("Cannot ping SQLite.", "path", c.SQLitePath, "error", err)
 		return err
@@ -78,14 +87,16 @@ func sqliteSearchByQuery(query string) ([]SongData, error) {
 	return scanSongs(rows)
 }
 
-// sqliteSearchByTitleArtist uses case-insensitive LIKE for parity with
-// the Postgres ILIKE implementation.
+// sqliteSearchByTitleArtist uses case-insensitive LIKE with wildcards for
+// parity with the Postgres ILIKE implementation.
+// Bare LIKE without % is exact match — Icecast metadata often differs
+// slightly from stored tags, so substring matching is required.
 func sqliteSearchByTitleArtist(title, artist string) ([]SongData, error) {
 	slog.Debug("sqliteSearchByTitleArtist.", "title", title, "artist", artist)
 	rows, err := dbs.Query(
 		`SELECT id, artist, title, album, genre, year FROM metadata
 		 WHERE title LIKE ? AND artist LIKE ? LIMIT 5`,
-		title, artist)
+		"%"+title+"%", "%"+artist+"%")
 	if err != nil {
 		slog.Error("sqliteSearchByTitleArtist failed.", "title", title, "artist", artist, "error", err)
 		return nil, err

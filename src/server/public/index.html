@@ -23,7 +23,8 @@
       <img id="artwork" src="./static/blank.jpg" alt="Album Art"/>
     </div>
     <div id="playerinfo">
-      <audio id="stream" src="" type="audio/mp3"></audio>
+      <!-- audio/mpeg is the correct MIME for MP3; audio/mp3 is non-standard -->
+      <audio id="stream" src="" type="audio/mpeg"></audio>
       <div id="song" class="nes-text">-</div>
       <div id="artist" class="nes-text is-primary">-</div>
       <div id="playButton" class="nes-btn is-primary">&#9654;</div>
@@ -32,7 +33,7 @@
         <input type="range" id="volume" class="nes-progress" value=".3" min="0" max="1" step="0.006">
       </div>
       <div id="status" class="nes-text is-disabled">Connecting...</div>
-      <div id="version">Listeners: <span id="listeners">-</span></div>
+      <div id="listeners">Listeners: -</div>
     </div>
   </div>
   <div id="controls">
