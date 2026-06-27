@@ -65,7 +65,6 @@ func searchByQuery(query string) (queryResults []SongData, err error) {
 
 // Takes a title and artist string to find a song which exactly matches.
 // Returns a list of SongData whose first result [0] is the first (best) match.
-// This will not work if multiple songs share the exact same title and artist.
 func searchByTitleArtist(title string, artist string) (queryResults []SongData, err error) {
 	title, artist = strings.TrimSpace(title), strings.TrimSpace(artist)
 	slog.Debug(fmt.Sprintf("Searching database for: %s by %s", title, artist), "func", "searchByTitleArtist")
@@ -110,9 +109,7 @@ func getPathById(id int) (path string, err error) {
 }
 
 // Takes an absolute song path, submits the path to be queued in Liquidsoap.
-// Returns the response message from Liquidsoap.
 func liquidsoapRequest(path string) (message string, err error) {
-	// Telnet to liquidsoap
 	slog.Debug("Connecting to liquidsoap service...", "func", "liquidsoapRequest")
 	conn, err := net.Dial("tcp", c.LiquidsoapAddress+c.LiquidsoapPort)
 	if err != nil {
@@ -120,7 +117,6 @@ func liquidsoapRequest(path string) (message string, err error) {
 		return "", err
 	}
 	defer conn.Close()
-	// Push song request to source service, listen for a response, and quit the telnet session.
 	fmt.Fprintf(conn, "request.push "+path+"\n")
 	message, err = bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
@@ -140,7 +136,6 @@ func liquidsoapSkip() (message string, err error) {
 	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "cadence1.skip\n")
-	// Listen for response
 	message, err = bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
 		slog.Error("Failed to read stream response message from audio source server.", "func", "liquidsoapSkip", "error", err)
@@ -150,7 +145,7 @@ func liquidsoapSkip() (message string, err error) {
 	return message, nil
 }
 
-// Watches the music directory (CSERVER_MUSICDIR) for any changes, and reconfigures the database.
+// Watches the music directory for any changes, and reconfigures the database.
 func filesystemMonitor() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -191,12 +186,12 @@ func filesystemMonitor() {
 // Watches the Icecast status page and updates stream info for SSE.
 func icecastMonitor() {
 	var prev = RadioInfo{}
-	// Resets now playing, stream URL, and listener global variables to defaults. Used when Icecast is unreachable.
 	icecastDataReset := func() {
 		now.Song.Title, now.Song.Artist, now.Host, now.Mountpoint = "-", "-", "-", "-"
 		now.Listeners = -1
 	}
 	checkIcecastStatus := func() {
+		// IcecastAddress must be host:port only (scheme stripped at startup)
 		resp, err := http.Get("http://" + c.IcecastAddress + c.IcecastPort + "/status-json.xsl")
 		if err != nil {
 			slog.Error("Unable to stream data from the Icecast service.", "func", "icecastMonitor", "error", err)
@@ -236,10 +231,10 @@ func icecastMonitor() {
 
 		if (prev.Song.Title != now.Song.Title) || (prev.Song.Artist != now.Song.Artist) {
 			slog.Info(fmt.Sprintf("Now Playing: %s by %s", now.Song.Title, now.Song.Artist), "func", "icecastMonitor")
-			// Dump the artwork rate limiter database first thing before updates
-			// are sent out to reset artwork request count.
-			dbr.RateLimitArt.FlushDB(ctx)
-
+			// Only flush Redis if it is available
+			if redisAvailable {
+				dbr.RateLimitArt.FlushDB(ctx)
+			}
 			radiodata_sse.SendEventMessage(now.Song.Title, "title", "")
 			radiodata_sse.SendEventMessage(now.Song.Artist, "artist", "")
 			if (prev.Song.Title != "") && (prev.Song.Artist != "") {
@@ -252,7 +247,8 @@ func icecastMonitor() {
 		}
 		if (prev.Host != now.Host) || (prev.Mountpoint != now.Mountpoint) {
 			slog.Info(fmt.Sprintf("Audio stream on: <%s/%s>", now.Host, now.Mountpoint), "func", "icecastMonitor")
-			radiodata_sse.SendEventMessage(fmt.Sprintf(now.Host, "/", now.Mountpoint), "listenurl", "")
+			// Fix: was fmt.Sprintf(now.Host, "/", now.Mountpoint) which used host as format string
+			radiodata_sse.SendEventMessage(fmt.Sprintf("%s/%s", now.Host, now.Mountpoint), "listenurl", "")
 		}
 		if prev.Listeners != now.Listeners {
 			slog.Info(fmt.Sprintf("Listener count: <%v>", now.Listeners), "func", "icecastMonitor")

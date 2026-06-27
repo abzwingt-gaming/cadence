@@ -39,7 +39,6 @@ func parseLogLevel(level string) slog.Level {
 	if level == "" {
 		return slog.LevelInfo
 	}
-
 	switch strings.ToLower(level) {
 	case "debug":
 		return slog.LevelDebug
@@ -55,6 +54,19 @@ func parseLogLevel(level string) slog.Level {
 	}
 }
 
+// stripScheme removes any http:// or https:// prefix from an address.
+// icecastMonitor always prepends http://, so the address must be host-only.
+func stripScheme(addr string) string {
+	for _, prefix := range []string{"https://", "http://"} {
+		if strings.HasPrefix(addr, prefix) {
+			slog.Warn(fmt.Sprintf("Scheme found in address '%s' - stripping to prevent malformed URLs. Use host:port format only.", addr),
+				"func", "stripScheme")
+			return strings.TrimPrefix(addr, prefix)
+		}
+	}
+	return addr
+}
+
 func main() {
 	c.Version = os.Getenv("CSERVER_VERSION")
 	c.RootPath = os.Getenv("CSERVER_ROOTPATH")
@@ -63,7 +75,7 @@ func main() {
 	c.MusicDir = os.Getenv("CSERVER_MUSIC_DIR")
 	c.LiquidsoapAddress = os.Getenv("CSERVER_LIQUIDSOAPADDRESS")
 	c.LiquidsoapPort = os.Getenv("CSERVER_LIQUIDSOAPPORT")
-	c.IcecastAddress = os.Getenv("CSERVER_ICECASTADDRESS")
+	c.IcecastAddress = stripScheme(os.Getenv("CSERVER_ICECASTADDRESS"))
 	c.IcecastPort = os.Getenv("CSERVER_ICECASTPORT")
 	c.PostgresAddress = os.Getenv("CSERVER_POSTGRESADDRESS")
 	c.PostgresPort = os.Getenv("CSERVER_POSTGRESPORT")
