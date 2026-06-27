@@ -1,59 +1,63 @@
-$(document).ready(function () {
-	const stream = document.getElementById("stream");
-	const volbar = document.getElementById("volume");
+// page.js - UI interaction: play/pause, volume, tabs, theme.
 
-	// Warn iOS and Safari users
-	let safariUA = /Apple/i.test(navigator.vendor);
-	let iOSUA =
-		/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
-	if (iOSUA || safariUA) {
-		alert(
-			"You appear to be using an iOS device or a Safari browser. Cadence stream playback may not be compatible with your platform."
-		);
-	}
+document.addEventListener('DOMContentLoaded', () => {
+  const stream  = document.getElementById('stream');
+  const volbar  = document.getElementById('volume');
+  const playBtn = document.getElementById('playButton');
 
-	// Loads and unloads audio stream source
-	document
-		.getElementById("playButton")
-		.addEventListener("click", function () {
-			if (stream.paused) {
-				stream.src = streamSrcURL;
-				stream.load();
-				stream.play();
-				document.getElementById("playButton").innerHTML = "⏸";
-			} else {
-				stream.src = "";
-				stream.load();
-				stream.pause();
-				document.getElementById("playButton").innerHTML = "⏵";
-			}
-		});
+  // Restore volume
+  volbar.value = stream.volume = parseFloat(localStorage.getItem('volumeKey') || '0.3');
+  volbar.addEventListener('input', () => {
+    stream.volume = parseFloat(volbar.value);
+    localStorage.setItem('volumeKey', volbar.value);
+  });
 
-	// Load cached volume level, or 30%
-	volbar.value = stream.volume = localStorage.getItem("volumeKey") || 0.3;
-	// Volume bar listeners
-	$("#volume")
-		.change(function () {
-			stream.volume = this.value;
-			localStorage.setItem("volumeKey", this.value);
-		})
-		.on("input", function () {
-			stream.volume = this.value;
-			localStorage.setItem("volumeKey", this.value);
-		});
+  // Play/pause
+  playBtn.addEventListener('click', () => {
+    if (stream.paused) {
+      stream.src = streamSrcURL;
+      stream.load();
+      stream.play();
+      playBtn.innerHTML = '&#9646;&#9646;';
+    } else {
+      stream.src = '';
+      stream.load();
+      stream.pause();
+      playBtn.innerHTML = '&#9654;';
+    }
+  });
 
-	// Search keyup
-	$("#searchInput").keyup(function (event) {
-		if (event.keyCode == 13) {
-			postSearch();
-		}
-	});
-
-	$('#tabs li').on('click', function() {
-        var tab = $(this).data('tab');
-        $('#tabs li').removeClass('is-active');
-        $(this).addClass('is-active');
-        $('#tab-content section').removeClass('is-active');
-        $('section[data-content="' + tab + '"]').addClass('is-active');
+  // Tabs
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active', 'is-primary'));
+      document.querySelectorAll('#tab-content section').forEach(s => s.classList.remove('is-active'));
+      btn.classList.add('active', 'is-primary');
+      document.querySelector(`section[data-content="${btn.dataset.tab}"]`).classList.add('is-active');
     });
+  });
+
+  // Theme: priority order:
+  //   1. localStorage (user explicitly toggled)
+  //   2. prefers-color-scheme (OS/browser setting)
+  //   3. fallback: dark
+  const html = document.documentElement;
+  const saved = localStorage.getItem('theme');
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const initialTheme = saved || (systemDark ? 'dark' : 'light');
+  html.setAttribute('data-theme', initialTheme);
+
+  document.getElementById('themeToggle').addEventListener('click', () => {
+    const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    html.setAttribute('data-theme', next);
+    localStorage.setItem('theme', next);
+  });
+
+  // Also react to OS theme changes live (e.g. auto dark mode at sunset)
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+    // Only follow OS if user hasn't overridden manually
+    if (!localStorage.getItem('theme')) {
+      html.setAttribute('data-theme', e.matches ? 'dark' : 'light');
+    }
+  });
 });

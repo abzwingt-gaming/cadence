@@ -1,52 +1,138 @@
-## 📻 About
+# Cadence — Homelab Fork
 
-**Cadence** (or *CadenceRadio*) is an all-in-one internet radio suite. 
+Self-hosted web radio. Fork of [kenellorando/cadence](https://github.com/kenellorando/cadence), hardened for homelab use.
 
-The project ships *Icecast* and *Liquidsoap* working out-of-the-box, made complete by a *Cadence API* providing song request, library search, album artwork, and real-time stream information in a browser UI.
+> **This fork does not send PRs upstream.** It is maintained independently.
 
-**See a live demo on [cadenceradio.com](https://cadenceradio.com/)!**
-
-<img src="https://user-images.githubusercontent.com/17265041/219263637-6971ce33-209a-4eb5-b67e-547f271dc3c8.png" width="600" >
-
-## 🏃 Get Started
-
-An interactive installation script is provided. Users familiar with Docker can be up and running in ~5 minutes.
-
-### Server Preparation
-
-- [Docker Engine](https://docs.docker.com/engine/install/) and [Docker Compose V2](https://docs.docker.com/compose/install/) are installed.
-- You have some music files (e.g. `.mp3`, `.flac`) with title and artist metadata.
-
-### Installation
-
-Clone the Cadence repository to your server, then run the following:
+## Quick start
 
 ```bash
-$ chmod +x ./install.sh
-$ ./install.sh
+git clone https://github.com/abzwingt-gaming/cadence
+cd cadence
+bash install.sh
 ```
 
-You will be prompted to provide an absolute path to a directory containing music, a stream hostname, a rate limit timeout, a service password, and optional reverse proxy configuration. If you need help figuring out what values to use, refer to the [Installation Guide](https://github.com/kenellorando/cadence/wiki/Installation#interactive-prompt-guide). 
+Or manually:
 
-Your radio stack will automatically launch and Cadence's web UI will become accessible at `localhost:8080`.
+```bash
+cp config/cadence.env.example config/cadence.env
+# Edit config/cadence.env — set CSERVER_MUSIC_DIR at minimum
+docker compose up -d
+```
 
-After initial installation, simply run `docker compose pull` to check for container updates, then `docker compose up` to start your station again. Run `./install.sh` again at any time to reconfigure. If you make changes to code locally, run `docker compose up --build` to build and run.
+With Postgres + Redis:
 
-## 🔬 Technical Details
+```bash
+docker compose --profile postgres --profile redis up -d
+```
 
-### Architecture
-<details>
-<summary><i>Basic Architecture</i></summary>
+## Configuration
 
-<img src="https://user-images.githubusercontent.com/17265041/228726513-e71775c4-dce4-4ef3-b4c2-1bbd37999769.png" width="800" >
+All config lives in `config/cadence.env`. See `config/cadence.env.example` for every option with comments.
 
-</details>
+### Key variables
 
-If you're interested in implementation details, [this blog post](https://cuddle.fish/posts/2022-11-08-cadence) does a dive into how a basic *Icecast/Liquidsoap* web radio works and the value Cadence provides.
+| Variable | Default | Description |
+|---|---|---|
+| `CSERVER_MUSIC_DIR` | *(required)* | Path to music files |
+| `CSERVER_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
+| `CSERVER_SQLITE_PATH` | `/data/cadence.db` | SQLite file location |
+| `CSERVER_ICECAST_STATUS_URL` | `http://icecast2:8000` | Internal Icecast URL (Docker only) |
+| `CSERVER_PUBLIC_STREAM_URL` | *(auto)* | Public stream URL sent to browser |
+| `CSERVER_REDISPASSWORD` | *(empty)* | Redis auth password |
+| `CSERVER_REDISDB` | `0` | Redis DB index |
+| `CSERVER_SCAN_WORKERS` | `4` | Parallel tag-read goroutines |
+| `CSERVER_DB_RETRIES` | `5` | DB connect attempts before fatal exit |
+| `CSERVER_DB_RETRY_DELAY_MS` | `3000` | Delay between DB retries |
+| `CSERVER_TITLE_CLEANUP_PATTERNS` | *(built-in)* | Pipe-separated regex to strip from titles |
 
-### API Reference for Custom Clients
-Cadence's GitHub Wiki also hosts an [API Reference](https://github.com/kenellorando/cadence/wiki/API-Reference) with complete request/response details, useful for anyone developing custom scripts or clients for their station.
+## Endpoints
 
-### Discord Server Integration
-Cadence installations can be directly integrated with Discord Servers using [CadenceBot](https://github.com/za419/CadenceBot). CadenceBot allows you to control your station through Discord chat and listen to the radio in voice channels! 
-You can quickly demo a CadenceBot by [adding it to your Discord server](https://discord.com/api/oauth2/authorize?client_id=372999377569972224&permissions=274881252352&scope=bot).
+| Path | Purpose |
+|---|---|
+| `/readyz` | **Liveness probe** — DB connected; use for Docker `HEALTHCHECK` |
+| `/healthz` | **Readiness probe** — DB + Icecast + Redis status JSON |
+| `/api/search` | POST search |
+| `/api/request/id` | POST request by ID |
+| `/api/nowplaying/metadata` | GET current track |
+| `/api/nowplaying/albumart` | GET base64 album art |
+| `/api/history` | GET play history |
+| `/api/listenurl` | GET public stream URL |
+| `/api/radiodata/sse` | SSE stream for live track/listener updates |
+
+## Custom CSS
+
+Edit `src/server/public/css/custom.css` — mounted into the container as a volume. No rebuild needed.
+
+Example overrides:
+
+```css
+:root { --art-size: 320px; }        /* bigger album art */
+#version { display: none; }          /* hide listener count */
+```
+
+## Caddy
+
+See `config/Caddyfile.example` — plain config, no snippets required.
+
+## Releasing
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+CI automatically:
+1. Builds multi-arch image (`linux/amd64` + `linux/arm64`)
+2. Pushes to `ghcr.io/abzwingt-gaming/cadence:v1.0.0` + `:latest`
+3. Creates GitHub Release with changelog
+
+## Changes vs upstream
+
+### Backend
+
+| Area | Upstream | This fork |
+|---|---|---|
+| DB backends | Postgres only | **Postgres or SQLite** (pure Go, no CGO) |
+| DB init | Drops and recreates DB | `CREATE TABLE IF NOT EXISTS` + upsert — **non-destructive** |
+| DB init failure | Silent warn | **Fatal exit after N retries** with clear error |
+| Redis | Required | **Optional** — graceful skip if unreachable |
+| Redis auth | None | **Password + DB index** (`CSERVER_REDISPASSWORD`, `CSERVER_REDISDB`) |
+| Music scan | Single-threaded | **Parallel goroutine pool** (`CSERVER_SCAN_WORKERS`) |
+| Bad/empty tags | Crash or skip | **Filename fallback**, always inserts |
+| Title cleanup | None | **Auto-strips yt-dlp suffixes** `(Official Video)`, `[HD]`, `- Topic`, etc. |
+| Audio formats | `.mp3 .flac .ogg` | **+ `.m4a .opus .wav .aac`** |
+| Icecast URL | One mixed-use var | **Internal status URL** separate from **public stream URL** |
+| Album art | Re-reads disk every request | **In-memory `sync.Map` cache**, cleared on track change |
+| Version | Env var only | **`ldflags` at build time** from git tag |
+| Liveness probe | `/ready` (200 always) | **`/readyz`** (checks DB) |
+| Readiness probe | None | **`/healthz`** (DB + Icecast + Redis JSON) |
+
+### Frontend
+
+| Area | Upstream | This fork |
+|---|---|---|
+| CSS framework | Bulma | **NES.css** (retro pixel art) |
+| Theme | Light only | **Dark + Light toggle**, persisted in `localStorage` |
+| Theme default | Hardcoded light | **Follows `prefers-color-scheme`** (OS dark mode) |
+| JS dependencies | jQuery | **Vanilla `fetch()` + DOM** — no jQuery |
+| Search | Fire on Enter only | **300ms debounce** on keyup |
+| CSS customisation | Rebuild required | **`custom.css` Docker volume mount** — edit without rebuild |
+| Stream status | `Disconnected` (binary) | `Waiting / Connected` with colour coding |
+| Rate limit message | Generic fail | **`Rate limited. Try again later.`** (HTTP 429) |
+
+### Infrastructure
+
+| Area | Upstream | This fork |
+|---|---|---|
+| Docker Compose | Single profile | **Profiles**: default / `--profile postgres` / `--profile redis` |
+| Proxy config | nginx only | **Caddy** (`config/Caddyfile.example`) |
+| Healthcheck | None in compose | **`wget /readyz`** in image + compose |
+| Install script | Interactive (basic) | **Env-driven, profile-aware**, sets up all options |
+| CI | None | **GitHub Actions**: build + lint on push/PR, release on tag |
+| Docker image | Manual build | **Published to `ghcr.io`** on `v*.*.*` tag, multi-arch |
+| Non-root container | No | **`adduser cadence`**, runs as non-root |
+
+## Improvements backlog
+
+See [IMPROVEMENTS.md](./IMPROVEMENTS.md).

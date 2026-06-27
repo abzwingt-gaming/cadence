@@ -1,128 +1,147 @@
-body {
-	font-family: "Roboto Condensed", sans-serif;
-	padding-left: 5%;
-	padding-right: 5%;
+/* main.css - Base styles. Override with custom.css (mounted volume). */
+
+:root {
+  --bg: #fff;
+  --fg: #212529;
+  --card-bg: #f8f8f8;
+  --border: #aaa;
+  --art-size: min(50vw, 240px);
 }
 
-footer {
-	font-size: 90%;
-	max-width: 320px;
-    text-align: center;
-    margin-top: 50px;
-    margin-bottom: 30px;
-	margin-left: auto;
-	margin-right: auto;
+[data-theme="dark"] {
+  --bg: #0d0d0d;
+  --fg: #e8e8e8;
+  --card-bg: #1a1a1a;
+  --border: #444;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: 'Press Start 2P', monospace;
+  font-size: 10px;
+  margin: 0;
+  padding: 0;
+  transition: background 0.2s, color 0.2s;
+}
+
+body {
+  padding: 16px;
+  max-width: 860px;
+  margin: 0 auto;
 }
 
 #player {
-	margin-top: 2%;
-	text-align: center;
+  margin-top: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
 }
 
 #artworkcontainer {
-	margin: 0 auto;
-	border: 1px solid black;
-	width: 50vw;
-	height: 50vw;
-	max-width: 240px;
-	max-height: 240px;
+  flex-shrink: 0;
+  width: var(--art-size);
+  height: var(--art-size);
+  border: 3px solid var(--border);
+  background: var(--card-bg);
+  overflow: hidden;
 }
 
-#player #song {
-	font-size: 24px;
+#artwork {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
-#player #artist {
-	font-size: 21px;
+#playerinfo {
+  flex: 1;
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-#player #playButton {
-	border: 1px solid black;
-	font-size: 20px;
-	text-align: center;
-	padding: 11px;
-	width: 80px;
-	height: 45px;
-	border-radius: 10%;
-	cursor: pointer;
-	margin-top: 20px;
-	margin-bottom: 20px;
-	margin-left: auto;
-	margin-right: auto;
-	line-height: 100%;
+#song   { font-size: 1.2em; line-height: 1.6; }
+#artist { font-size: 1.0em; }
+
+#playButton {
+  cursor: pointer;
+  width: 80px;
+  text-align: center;
 }
 
-#player #status,
-#player #version {
-	font-size: 14px;
+#volumerow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-#searchResults tr, #historyResults tr {
-	max-height: 100%;
+#volume { flex: 1; }
+
+#status, #version { font-size: 0.75em; opacity: 0.8; }
+
+#controls {
+  margin: 12px 0;
+  text-align: right;
 }
 
-#searchResults tr th, #searchResults tr td, #historyResults tr th, #historyResults tr td{
-	text-align: left;
-	margin-top: auto;
-	vertical-align: center;
-	font-size: 17px;
+#tabs ul {
+  display: flex;
+  gap: 8px;
+  padding: 0;
+  list-style: none;
+  margin: 16px 0 8px;
 }
 
-#tab-content section {
-    display: none;
-}
-#tab-content section.is-active {
-    display: block;
-}
+#tab-content section { display: none; }
+#tab-content section.is-active { display: block; }
 
+.nes-field { margin: 8px 0; }
 
-#requestStatus, #historyStatus {
-	text-align: center;
-	margin-top: 5px;
-	margin-bottom: 5px;
+#searchResults, #historyResults {
+  margin-top: 8px;
 }
 
-@media (min-width: 769px) {
-	body {
-		padding-left: 16%;
-		padding-right: 16%;
-	}
-
-	#playerinfo {
-		text-align: left;
-	}
-
-	#player #playButton {
-		margin-left: 0;
-		margin-right: 0;
-	}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+th, td {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
 }
 
-@media (min-width: 1200px) {
-	body {
-		padding-left: 23%;
-		padding-right: 23%;
-	}
+footer {
+  margin-top: 32px;
+  padding: 16px;
+  font-size: 0.75em;
+  display: flex;
+  justify-content: space-between;
+  border-top: 2px solid var(--border);
 }
 
-@media (min-width: 1600px) {
-	body {
-		padding-left: 26%;
-		padding-right: 26%;
-	}
+/* NES.css dark overrides */
+[data-theme="dark"] .nes-container {
+  background: var(--card-bg);
+  color: var(--fg);
 }
-
-@media (min-width: 1800px) {
-	body {
-		padding-left: 29%;
-		padding-right: 29%;
-	}
-
-	#player #song {
-		font-size: 28px;
-	}
-
-	#player #artist {
-		font-size: 25px;
-	}
+[data-theme="dark"] .nes-container::before,
+[data-theme="dark"] .nes-container::after,
+[data-theme="dark"] .nes-container > .title::before,
+[data-theme="dark"] .nes-container > .title::after {
+  background-color: var(--card-bg);
+}
+[data-theme="dark"] .nes-input,
+[data-theme="dark"] .nes-textarea {
+  background: #111;
+  color: #e8e8e8;
+}
+[data-theme="dark"] .nes-btn {
+  background: #222;
+  color: #e8e8e8;
 }
