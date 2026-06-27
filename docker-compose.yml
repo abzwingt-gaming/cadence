@@ -74,6 +74,12 @@ services:
         condition: service_healthy
       liquidsoap:
         condition: service_started
+      postgres:
+        condition: service_healthy
+        required: false
+      redis:
+        condition: service_healthy
+        required: false
     networks:
       - services-net
     healthcheck:
@@ -97,7 +103,7 @@ services:
     networks:
       - services-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-cadence}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -107,18 +113,21 @@ services:
     image: redis:7-alpine
     container_name: cadence-redis
     restart: unless-stopped
+    # Only pass --requirepass when a password is actually set.
+    # Passing --requirepass "" in Redis 7 sets an empty-string password
+    # which is functionally different from no auth and breaks redis-cli ping.
     command: >
-      redis-server
-      --requirepass "${REDIS_PASSWORD:-}"
-      --save ""
-      --appendonly no
+      sh -c '
+        if [ -n "$${REDIS_PASSWORD}" ]; then
+          exec redis-server --requirepass "$${REDIS_PASSWORD}" --save "" --appendonly no
+        else
+          exec redis-server --save "" --appendonly no
+        fi'
     expose:
       - "6379"
     networks:
       - services-net
     healthcheck:
-      # redis-cli ping must supply the password when auth is enabled.
-      # REDIS_PASSWORD is injected via .env; falls back to empty string (no auth).
       test:
         - "CMD-SHELL"
         - |

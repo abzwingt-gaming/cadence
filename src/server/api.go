@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"github.com/dhowden/tag"
@@ -22,6 +23,16 @@ var rescanRunning atomic.Bool
 // streamIdle reports whether the icecast monitor has set sentinel "idle" values.
 func streamIdle(title, artist string) bool {
 	return title == "" || title == "-" || artist == "-"
+}
+
+// buildPublicStream constructs the public stream URL from host+mountpoint,
+// trimming slashes to prevent double-slash when host ends with "/" or
+// mountpoint starts with "/".
+func buildPublicStream(host, mountpoint string) string {
+	if c.PublicStreamURL != "" {
+		return c.PublicStreamURL
+	}
+	return strings.TrimRight(host, "/") + "/" + strings.TrimLeft(mountpoint, "/")
 }
 
 func Search() http.HandlerFunc {
@@ -208,10 +219,9 @@ func History() http.HandlerFunc {
 func ListenURL() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
-		publicURL := c.PublicStreamURL
-		if publicURL == "" {
-			publicURL = n.Host + "/" + n.Mountpoint
-		}
+		// buildPublicStream trims slashes to prevent double-slash when
+		// Icecast host ends with "/" or mountpoint starts with "/".
+		publicURL := buildPublicStream(n.Host, n.Mountpoint)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(struct{ ListenURL string }{ListenURL: publicURL})
 	}
