@@ -10,7 +10,7 @@ import (
 
 var radiodata_sse = eventsource.New(nil, nil)
 
-func routes() *http.ServeMux {
+func routes() http.Handler {
 	r := http.NewServeMux()
 	r.Handle("/api/radiodata/sse",       radiodata_sse)
 	r.Handle("/api/search",              Search())
@@ -29,6 +29,6 @@ func routes() *http.ServeMux {
 		r.Handle("/api/dev/skip",        DevSkip())
 		r.Handle("/api/admin/rescan",    AdminRescan())
 	}
-	r.Handle("/", http.FileServer(http.Dir(c.RootPath+"./public/")))
-	return r
+	r.Handle("/", http.FileServer(http.Dir(c.RootPath)))
+	return loggingMiddleware(r)
 }
