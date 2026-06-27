@@ -172,11 +172,13 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByTitleArtist(title, artist)
 	}
+	// Use ILIKE with wildcards for fuzzy matching — Icecast metadata may
+	// include extra punctuation or spacing not present in the DB tags.
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE title ILIKE $1 AND artist ILIKE $2 LIMIT 5`,
 		c.PostgresTableName)
-	rows, err := dbp.Query(sel, title, artist)
+	rows, err := dbp.Query(sel, "%"+title+"%", "%"+artist+"%")
 	if err != nil {
 		slog.Error("searchByTitleArtist failed.", "title", title, "artist", artist, "error", err)
 		return nil, err
@@ -297,7 +299,9 @@ func dbPopulate() error {
 func extractTags(path string) (title, album, artist, genre, year string) {
 	guessArtist, guessTitle := guessFromFilename(path)
 
-	title = cleanTitle(guessTitle)
+	// Sanitize the filename-guessed title with a fallback to the bare filename
+	// so cleanup regexes that strip everything don't leave an empty title.
+	title = sanitize(cleanTitle(guessTitle), filepath.Base(path))
 	artist = sanitize(guessArtist, "Unknown Artist")
 	album = "Unknown Album"
 
@@ -315,7 +319,9 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	}
 
 	if t := strings.TrimSpace(tags.Title()); t != "" {
-		title = cleanTitle(t)
+		// Sanitize cleaned tag title too — fallback to raw tag if cleanup
+		// strips everything (e.g. title is literally "(Official Video)").
+		title = sanitize(cleanTitle(t), t)
 	}
 	if a := strings.TrimSpace(tags.Artist()); a != "" {
 		artist = cleanArtist(a)

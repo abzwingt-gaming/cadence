@@ -202,7 +202,7 @@ func filesystemMonitor() {
 // icecastSource extracts per-source fields from the parsed Icecast JSON.
 // Icecast returns "source" as either a single object or an array when
 // multiple mountpoints are active. We always pick the first active source
-// that matches our mountpoint (or simply the first one).
+// that matches our public stream URL (if configured), or simply the first one.
 func icecastSource(j *gabs.Container) *gabs.Container {
 	src := j.Path("icestats.source")
 	if src == nil {
@@ -210,14 +210,12 @@ func icecastSource(j *gabs.Container) *gabs.Container {
 	}
 	// Array case: multiple mountpoints.
 	if children, err := src.Children(); err == nil && len(children) > 0 {
-		// Prefer the mountpoint that matches our configured public stream,
-		// otherwise fall back to the first child.
-		mount := "/" + c.PostgresTableName // e.g. /cadence1 — not ideal, use a dedicated config field eventually
-		_ = mount
-		for _, child := range children {
-			if listenURL, ok := child.Path("listenurl").Data().(string); ok {
-				if c.PublicStreamURL != "" && strings.Contains(listenURL, c.PublicStreamURL) {
-					return child
+		if c.PublicStreamURL != "" {
+			for _, child := range children {
+				if listenURL, ok := child.Path("listenurl").Data().(string); ok {
+					if strings.Contains(listenURL, c.PublicStreamURL) {
+						return child
+					}
 				}
 			}
 		}
@@ -318,7 +316,10 @@ func icecastMonitor() {
 			}
 			radiodata_sse.SendEventMessage(nowSnap.Song.Title, "title", "")
 			radiodata_sse.SendEventMessage(nowSnap.Song.Artist, "artist", "")
-			if prev.Song.Title != "" && prev.Song.Artist != "" && prev.Song.Title != "-" {
+			// Only record to history when the previous track was a real song
+			// (not the idle sentinel "-" for either title or artist).
+			if prev.Song.Title != "" && prev.Song.Title != "-" &&
+				prev.Song.Artist != "" && prev.Song.Artist != "-" {
 				historyMu.Lock()
 				history = append(history, playRecord{
 					Title:  prev.Song.Title,
@@ -334,9 +335,13 @@ func icecastMonitor() {
 			}
 		}
 
+		// Build the public stream URL cleanly to avoid double-slash when
+		// Host already ends with "/" or Mountpoint already starts with "/".
 		publicStream := c.PublicStreamURL
 		if publicStream == "" {
-			publicStream = nowSnap.Host + "/" + nowSnap.Mountpoint
+			host := strings.TrimRight(nowSnap.Host, "/")
+			mount := strings.TrimLeft(nowSnap.Mountpoint, "/")
+			publicStream = host + "/" + mount
 		}
 		if prev.Host != nowSnap.Host || prev.Mountpoint != nowSnap.Mountpoint {
 			radiodata_sse.SendEventMessage(publicStream, "listenurl", "")
