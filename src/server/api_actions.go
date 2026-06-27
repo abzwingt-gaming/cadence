@@ -1,5 +1,5 @@
 // api_actions.go
-// API interactions for Postgres, Icecast, Liquidsoap.
+// Icecast monitor, Liquidsoap telnet, filesystem watcher.
 
 package main
 
@@ -10,15 +10,20 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Jeffail/gabs"
 	"github.com/fsnotify/fsnotify"
 )
 
-var now = RadioInfo{}
+var now     = RadioInfo{}
+var nowMu   sync.RWMutex
+
+// artCache holds base64-encoded art keyed by song path, cleared on track change.
+var artCache   sync.Map
+var artCacheKey string
 
 type RadioInfo struct {
 	Song       SongData
@@ -38,234 +43,179 @@ type SongData struct {
 	Path   string
 }
 
-// Takes a query string to search the database.
-// Returns a slice of SongData of songs ordered by relevance.
-func searchByQuery(query string) (queryResults []SongData, err error) {
-	query = strings.TrimSpace(query)
-	slog.Debug(fmt.Sprintf("Searching database for query: '%v'", query), "func", "searchByQuery")
-	selectWhereStatement := fmt.Sprintf("SELECT \"id\", \"artist\", \"title\",\"album\", \"genre\", \"year\" FROM %s ",
-		c.PostgresTableName) + "WHERE artist ILIKE $1 OR title ILIKE $2 ORDER BY LEAST(levenshtein($3, artist), levenshtein($4, title))"
-	rows, err := dbp.Query(selectWhereStatement, "%"+query+"%", "%"+query+"%", query, query)
-	if err != nil {
-		slog.Error("Database search failed.", "func", "searchByQuery", "error", err)
-		return nil, err
-	}
-	for rows.Next() {
-		song := &SongData{}
-		err = rows.Scan(&song.ID, &song.Artist, &song.Title, &song.Album, &song.Genre, &song.Year)
-		if err != nil {
-			slog.Error("Data scan failed.", "func", "searchByQuery", "error", err)
-			continue
-		}
-		queryResults = append(queryResults,
-			SongData{ID: song.ID, Artist: song.Artist, Title: song.Title, Album: song.Album, Genre: song.Genre, Year: song.Year})
-	}
-	return queryResults, nil
+// NowSnapshot returns a safe copy of now.
+func NowSnapshot() RadioInfo {
+	nowMu.RLock()
+	defer nowMu.RUnlock()
+	return now
 }
 
-// Takes a title and artist string to find a song which exactly matches.
-// Returns a list of SongData whose first result [0] is the first (best) match.
-// This will not work if multiple songs share the exact same title and artist.
-func searchByTitleArtist(title string, artist string) (queryResults []SongData, err error) {
-	title, artist = strings.TrimSpace(title), strings.TrimSpace(artist)
-	slog.Debug(fmt.Sprintf("Searching database for: %s by %s", title, artist), "func", "searchByTitleArtist")
-	selectStatement := fmt.Sprintf("SELECT id,artist,title,album,genre,year FROM %s WHERE title LIKE $1 AND artist LIKE $2;",
-		c.PostgresTableName)
-	rows, err := dbp.Query(selectStatement, title, artist)
+func liquidsoapRequest(path string) (string, error) {
+	conn, err := net.DialTimeout("tcp", c.LiquidsoapAddress+c.LiquidsoapPort, 5*time.Second)
 	if err != nil {
-		slog.Error("Could not query DB.", "func", "searchByTitleArtist", "error", err)
-		return nil, err
-	}
-	for rows.Next() {
-		song := &SongData{}
-		err = rows.Scan(&song.ID, &song.Artist, &song.Title, &song.Album, &song.Genre, &song.Year)
-		if err != nil {
-			slog.Error("Data scan failed.", "func", "searchByTitleArtist", "error", err)
-			continue
-		}
-		queryResults = append(queryResults,
-			SongData{ID: song.ID, Artist: song.Artist, Title: song.Title, Album: song.Album, Genre: song.Genre, Year: song.Year})
-	}
-	return queryResults, nil
-}
-
-// Takes a song ID integer.
-// Returns the absolute path of the audio file.
-func getPathById(id int) (path string, err error) {
-	slog.Debug(fmt.Sprintf("Searching database for the path of song: '%v'", id), "func", "getPathById")
-	selectWhereStatement := fmt.Sprintf("SELECT \"path\" FROM %s WHERE id=%v", c.PostgresTableName, id)
-	rows, err := dbp.Query(selectWhereStatement)
-	if err != nil {
-		slog.Error("Database search failed.", "func", "getPathById", "error", err)
-		return "", err
-	}
-	for rows.Next() {
-		err = rows.Scan(&path)
-		if err != nil {
-			slog.Error("Data scan failed.", "func", "getPathById", "error", err)
-			return "", err
-		}
-	}
-	return path, nil
-}
-
-// Takes an absolute song path, submits the path to be queued in Liquidsoap.
-// Returns the response message from Liquidsoap.
-func liquidsoapRequest(path string) (message string, err error) {
-	// Telnet to liquidsoap
-	slog.Debug("Connecting to liquidsoap service...", "func", "liquidsoapRequest")
-	conn, err := net.Dial("tcp", c.LiquidsoapAddress+c.LiquidsoapPort)
-	if err != nil {
-		slog.Error("Failed to connect to audio source server.", "func", "liquidsoapRequest", "error", err)
+		slog.Error("Liquidsoap connect failed.", "error", err)
 		return "", err
 	}
 	defer conn.Close()
-	// Push song request to source service, listen for a response, and quit the telnet session.
-	fmt.Fprintf(conn, "request.push "+path+"\n")
-	message, err = bufio.NewReader(conn).ReadString('\n')
+	fmt.Fprintf(conn, "request.push %s\n", path)
+	msg, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		slog.Error("Failed to read stream response message from audio source server.", "func", "liquidsoapRequest", "error", err)
+		slog.Error("Liquidsoap read failed.", "error", err)
 	}
-	slog.Info(fmt.Sprintf("Message from audio source server: %s", message), "func", "liquidsoapRequest")
-	fmt.Fprintf(conn, "quit"+"\n")
-	return message, nil
+	fmt.Fprintf(conn, "quit\n")
+	slog.Info("Liquidsoap response.", "msg", strings.TrimSpace(msg))
+	return msg, nil
 }
 
-func liquidsoapSkip() (message string, err error) {
-	slog.Debug("Connecting to liquidsoap service...", "func", "liquidsoapSkip")
-	conn, err := net.Dial("tcp", c.LiquidsoapAddress+c.LiquidsoapPort)
+func liquidsoapSkip() (string, error) {
+	conn, err := net.DialTimeout("tcp", c.LiquidsoapAddress+c.LiquidsoapPort, 5*time.Second)
 	if err != nil {
-		slog.Error("Failed to connect to audio source server.", "func", "liquidsoapSkip", "error", err)
+		slog.Error("Liquidsoap connect failed.", "error", err)
 		return "", err
 	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "cadence1.skip\n")
-	// Listen for response
-	message, err = bufio.NewReader(conn).ReadString('\n')
+	msg, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		slog.Error("Failed to read stream response message from audio source server.", "func", "liquidsoapSkip", "error", err)
+		slog.Error("Liquidsoap skip read failed.", "error", err)
 	}
-	slog.Debug(fmt.Sprintf("Message from audio source server: %s", message), "func", "liquidsoapSkip")
-	fmt.Fprintf(conn, "quit"+"\n")
-	return message, nil
+	fmt.Fprintf(conn, "quit\n")
+	return msg, nil
 }
 
-// Watches the music directory (CSERVER_MUSICDIR) for any changes, and reconfigures the database.
 func filesystemMonitor() {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		slog.Error("Error creating watcher.", "func", "fileSystemMonitor", "error", err)
+		slog.Error("fsnotify failed.", "error", err)
 		return
 	}
 	defer watcher.Close()
-	err = watcher.Add(c.MusicDir)
-	if err != nil {
-		slog.Error("Error adding music directory to watcher.", "func", "fileSystemMonitor", "error", err)
+	if err = watcher.Add(c.MusicDir); err != nil {
+		slog.Error("Cannot watch music dir.", "error", err)
 		return
 	}
-	done := make(chan bool)
-	go func() {
-		for {
-			select {
-			case _, ok := <-watcher.Events:
-				if !ok {
-					continue
-				}
-				slog.Info("Change detected in music library.", "func", "fileSystemMonitor")
-				err = postgresPopulate()
-				if err != nil {
-					slog.Error("Failed to populate.", "func", "fileSystemMonitor", "error", err)
-					return
-				}
-			case err, ok := <-watcher.Errors:
-				if !ok {
-					continue
-				}
-				slog.Error("Error watching music library.", "func", "fileSystemMonitor", "error", err)
+	// Debounce: wait 3s after last event before repopulating
+	var debounce *time.Timer
+	for {
+		select {
+		case _, ok := <-watcher.Events:
+			if !ok {
+				return
 			}
+			if debounce != nil {
+				debounce.Stop()
+			}
+			debounce = time.AfterFunc(3*time.Second, func() {
+				slog.Info("Music dir changed, repopulating DB.")
+				if err := dbPopulate(); err != nil {
+					slog.Error("Repopulate failed.", "error", err)
+				}
+			})
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			slog.Error("Watcher error.", "error", err)
 		}
-	}()
-	<-done
+	}
 }
 
-// Watches the Icecast status page and updates stream info for SSE.
 func icecastMonitor() {
-	var prev = RadioInfo{}
-	// Resets now playing, stream URL, and listener global variables to defaults. Used when Icecast is unreachable.
-	icecastDataReset := func() {
-		now.Song.Title, now.Song.Artist, now.Host, now.Mountpoint = "-", "-", "-", "-"
+	var prev RadioInfo
+	reset := func() {
+		nowMu.Lock()
+		now.Song.Title, now.Song.Artist = "-", "-"
+		now.Host, now.Mountpoint = "-", "-"
 		now.Listeners = -1
+		nowMu.Unlock()
 	}
-	checkIcecastStatus := func() {
-		resp, err := http.Get("http://" + c.IcecastAddress + c.IcecastPort + "/status-json.xsl")
+	check := func() {
+		resp, err := http.Get(c.IcecastStatusURL + "/status-json.xsl")
 		if err != nil {
-			slog.Error("Unable to stream data from the Icecast service.", "func", "icecastMonitor", "error", err)
-			icecastDataReset()
+			slog.Debug("Icecast unreachable.", "error", err)
+			reset()
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			slog.Debug("Unable to connect to Icecast.", "func", "icecastMonitor")
-			icecastDataReset()
+			reset()
 			return
 		}
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			slog.Debug("Connected to Icecast but unable to read response.", "func", "icecastMonitor")
-			icecastDataReset()
+			reset()
 			return
 		}
-		jsonParsed, err := gabs.ParseJSON([]byte(body))
+		j, err := gabs.ParseJSON(body)
 		if err != nil {
-			slog.Debug("Connected to Icecast but unable to parse response.", "func", "icecastMonitor")
-			icecastDataReset()
+			reset()
 			return
 		}
-		if jsonParsed.Path("icestats.source.title").Data() == nil || jsonParsed.Path("icestats.source.artist").Data() == nil {
-			slog.Debug("Connected to Icecast, but saw nothing playing.", "func", "icecastMonitor")
-			icecastDataReset()
+		artistVal := j.Path("icestats.source.artist").Data()
+		titleVal  := j.Path("icestats.source.title").Data()
+		if artistVal == nil || titleVal == nil {
+			reset()
 			return
 		}
 
-		now.Song.Artist = jsonParsed.Path("icestats.source.artist").Data().(string)
-		now.Song.Title = jsonParsed.Path("icestats.source.title").Data().(string)
-		now.Host = jsonParsed.Path("icestats.host").Data().(string)
-		now.Mountpoint = jsonParsed.Path("icestats.source.server_name").Data().(string)
-		now.Listeners = jsonParsed.Path("icestats.source.listeners").Data().(float64)
-		now.Bitrate = jsonParsed.Path("icestats.source.bitrate").Data().(float64)
+		nowMu.Lock()
+		now.Song.Artist = artistVal.(string)
+		now.Song.Title  = titleVal.(string)
+		if h := j.Path("icestats.host").Data(); h != nil {
+			now.Host = h.(string)
+		}
+		if m := j.Path("icestats.source.server_name").Data(); m != nil {
+			now.Mountpoint = m.(string)
+		}
+		if l := j.Path("icestats.source.listeners").Data(); l != nil {
+			now.Listeners = l.(float64)
+		}
+		if b := j.Path("icestats.source.bitrate").Data(); b != nil {
+			now.Bitrate = b.(float64)
+		}
+		nowMu.Unlock()
 
-		if (prev.Song.Title != now.Song.Title) || (prev.Song.Artist != now.Song.Artist) {
-			slog.Info(fmt.Sprintf("Now Playing: %s by %s", now.Song.Title, now.Song.Artist), "func", "icecastMonitor")
-			// Dump the artwork rate limiter database first thing before updates
-			// are sent out to reset artwork request count.
-			dbr.RateLimitArt.FlushDB(ctx)
+		nowSnap := NowSnapshot()
 
-			radiodata_sse.SendEventMessage(now.Song.Title, "title", "")
-			radiodata_sse.SendEventMessage(now.Song.Artist, "artist", "")
-			if (prev.Song.Title != "") && (prev.Song.Artist != "") {
-				history = append(history, playRecord{Title: prev.Song.Title, Artist: prev.Song.Artist, Ended: time.Now()})
+		if prev.Song.Title != nowSnap.Song.Title || prev.Song.Artist != nowSnap.Song.Artist {
+			slog.Info("Now Playing.", "title", nowSnap.Song.Title, "artist", nowSnap.Song.Artist)
+			// Invalidate art cache
+			artCache = sync.Map{}
+			if redisAvailable {
+				dbr.RateLimitArt.FlushDB(ctx)
+			}
+			radiodata_sse.SendEventMessage(nowSnap.Song.Title, "title", "")
+			radiodata_sse.SendEventMessage(nowSnap.Song.Artist, "artist", "")
+			if prev.Song.Title != "" && prev.Song.Artist != "" {
+				history = append(history, playRecord{
+					Title:  prev.Song.Title,
+					Artist: prev.Song.Artist,
+					Ended:  time.Now(),
+				})
 				if len(history) > 10 {
 					history = history[1:]
 				}
 				radiodata_sse.SendEventMessage("update", "history", "")
 			}
 		}
-		if (prev.Host != now.Host) || (prev.Mountpoint != now.Mountpoint) {
-			slog.Info(fmt.Sprintf("Audio stream on: <%s/%s>", now.Host, now.Mountpoint), "func", "icecastMonitor")
-			radiodata_sse.SendEventMessage(fmt.Sprintf(now.Host, "/", now.Mountpoint), "listenurl", "")
+
+		// Public stream URL: prefer CSERVER_PUBLIC_STREAM_URL, fallback to Icecast host/mountpoint
+		publicStream := c.PublicStreamURL
+		if publicStream == "" {
+			publicStream = nowSnap.Host + "/" + nowSnap.Mountpoint
 		}
-		if prev.Listeners != now.Listeners {
-			slog.Info(fmt.Sprintf("Listener count: <%v>", now.Listeners), "func", "icecastMonitor")
-			radiodata_sse.SendEventMessage(fmt.Sprint(now.Listeners), "listeners", "")
+		if prev.Host != nowSnap.Host || prev.Mountpoint != nowSnap.Mountpoint {
+			radiodata_sse.SendEventMessage(publicStream, "listenurl", "")
 		}
-		prev = now
+		if prev.Listeners != nowSnap.Listeners {
+			radiodata_sse.SendEventMessage(fmt.Sprint(nowSnap.Listeners), "listeners", "")
+		}
+		prev = nowSnap
 	}
-	go func() {
-		for {
-			time.Sleep(1 * time.Second)
-			checkIcecastStatus()
-		}
-	}()
+	for {
+		time.Sleep(1 * time.Second)
+		check()
+	}
 }
 
 var history = make([]playRecord, 0, 10)
