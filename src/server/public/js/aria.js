@@ -14,6 +14,13 @@ const API = {
 
 let streamSrcURL = '';
 
+// esc() prevents XSS when inserting user-controlled strings into innerHTML.
+function esc(str) {
+  const d = document.createElement('div');
+  d.appendChild(document.createTextNode(String(str)));
+  return d.innerHTML;
+}
+
 // --- SSE ---
 const sse = new EventSource(API.sse);
 
@@ -29,27 +36,32 @@ sse.addEventListener('listenurl', e => {
   document.getElementById('status').textContent = 'Connected';
   document.getElementById('status').className = 'nes-text is-success';
 });
-sse.addEventListener('listeners', e => {
-  updateInfo();
-});
-sse.addEventListener('bitrate', e => {
-  updateInfo();
-});
-sse.addEventListener('history', () => loadHistory());
+sse.addEventListener('listeners', () => scheduleInfoUpdate());
+sse.addEventListener('bitrate',   () => scheduleInfoUpdate());
+sse.addEventListener('history',   () => loadHistory());
 
 sse.onerror = () => {
   document.getElementById('status').textContent = 'Waiting for stream...';
   document.getElementById('status').className = 'nes-text is-warning';
 };
 
-// --- Info bar: listeners + bitrate ---
+// --- Info bar: listeners + bitrate (debounced to avoid fetch storms) ---
+let _infoTimer = null;
+function scheduleInfoUpdate() {
+  if (_infoTimer) return;
+  _infoTimer = setTimeout(() => {
+    _infoTimer = null;
+    updateInfo();
+  }, 300);
+}
+
 function updateInfo() {
   Promise.all([
     fetch('/api/listeners').then(r => r.json()),
     fetch(API.bitrate).then(r => r.json()),
   ]).then(([l, b]) => {
-    const listeners = l.Listeners >= 0 ? l.Listeners : '?';
-    const bitrate   = b.Bitrate   >  0 ? b.Bitrate + ' kbps' : '';
+    const listeners = (l.Listeners >= 0) ? l.Listeners : '?';
+    const bitrate   = (b.Bitrate   >  0) ? b.Bitrate + ' kbps' : '';
     document.getElementById('version').textContent =
       'Listeners: ' + listeners + (bitrate ? '  ·  ' + bitrate : '');
   }).catch(() => {});
@@ -63,14 +75,16 @@ fetch(API.version).then(r => r.json()).then(d => {
 // --- Album art ---
 function fetchArt() {
   fetch(API.art).then(r => {
-    if (r.status === 204 || r.status === 404) {
+    // 204 = no art found; 404 = song not in DB; 503 = stream idle.
+    if (r.status === 204 || r.status === 404 || r.status === 503) {
       document.getElementById('artwork').src = './static/blank.jpg';
       return null;
     }
     return r.json();
   }).then(d => {
     if (d && d.Picture) {
-      document.getElementById('artwork').src = 'data:image/jpeg;base64,' + d.Picture;
+      // Use image/* so PNG covers aren't forced through a JPEG decoder.
+      document.getElementById('artwork').src = 'data:image/*;base64,' + d.Picture;
     }
   }).catch(() => {
     document.getElementById('artwork').src = './static/blank.jpg';
@@ -99,23 +113,44 @@ function doSearch(q) {
       el.innerHTML = '<p class="nes-text">No results.</p>';
       return;
     }
-    el.innerHTML = results.map(s =>
-      `<div class="search-result nes-container" data-id="${s.ID}">
-        <span class="song-title">${s.Title}</span>
-        <span class="song-artist nes-text is-primary"> — ${s.Artist}</span>
-        <button class="nes-btn is-primary request-btn" data-id="${s.ID}">&#9654; Request</button>
-      </div>`
-    ).join('');
-    el.querySelectorAll('.request-btn').forEach(btn => {
+    // Build DOM nodes instead of innerHTML to prevent XSS.
+    el.innerHTML = '';
+    results.forEach(s => {
+      const div = document.createElement('div');
+      div.className = 'search-result nes-container';
+      div.dataset.id = s.ID;
+
+      const title  = document.createElement('span');
+      title.className = 'song-title';
+      title.textContent = s.Title;
+
+      const sep = document.createTextNode(' — ');
+
+      const artist = document.createElement('span');
+      artist.className = 'song-artist nes-text is-primary';
+      artist.textContent = s.Artist;
+
+      const btn = document.createElement('button');
+      btn.className = 'nes-btn is-primary request-btn';
+      btn.dataset.id = s.ID;
+      btn.innerHTML = '&#9654; Request';
       btn.addEventListener('click', () => requestSong(btn.dataset.id));
+
+      div.appendChild(title);
+      div.appendChild(sep);
+      div.appendChild(artist);
+      div.appendChild(btn);
+      el.appendChild(div);
     });
   }).catch(() => {
     document.getElementById('searchResults').innerHTML = '<p class="nes-text is-error">Search error.</p>';
   });
 }
 
+let _reqClearTimer = null;
 function requestSong(id) {
   const statusEl = document.getElementById('requestStatus');
+  if (_reqClearTimer) clearTimeout(_reqClearTimer);
   fetch(API.reqId, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -130,6 +165,12 @@ function requestSong(id) {
       ? 'Rate limited. Try again later.'
       : 'Request failed.';
     statusEl.className = 'nes-text is-error';
+  }).finally(() => {
+    // Auto-clear status message after 4 seconds.
+    _reqClearTimer = setTimeout(() => {
+      statusEl.textContent = '';
+      statusEl.className = '';
+    }, 4000);
   });
 }
 
@@ -141,12 +182,27 @@ function loadHistory() {
       el.innerHTML = '<p class="nes-text">No history yet.</p>';
       return;
     }
-    el.innerHTML = [...items].reverse().map(h =>
-      `<div class="history-item nes-container">
-        <span class="song-title">${h.Title}</span>
-        <span class="song-artist nes-text is-primary"> — ${h.Artist}</span>
-      </div>`
-    ).join('');
+    // Build DOM nodes to prevent XSS from song metadata.
+    el.innerHTML = '';
+    [...items].reverse().forEach(h => {
+      const div = document.createElement('div');
+      div.className = 'history-item nes-container';
+
+      const title = document.createElement('span');
+      title.className = 'song-title';
+      title.textContent = h.Title;
+
+      const sep = document.createTextNode(' — ');
+
+      const artist = document.createElement('span');
+      artist.className = 'song-artist nes-text is-primary';
+      artist.textContent = h.Artist;
+
+      div.appendChild(title);
+      div.appendChild(sep);
+      div.appendChild(artist);
+      el.appendChild(div);
+    });
   }).catch(() => {});
 }
 loadHistory();
