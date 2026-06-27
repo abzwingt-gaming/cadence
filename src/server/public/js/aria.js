@@ -1,7 +1,7 @@
 var streamSrcURL = "";
 
 $(document).ready(function() {
-	getListenURL()
+	getStreamURL()
 	getHistory()
 	getNowPlayingMetadata()
 	getNowPlayingAlbumArt()
@@ -50,7 +50,7 @@ function getNowPlayingAlbumArt() {
 			if (data == undefined) {
 				$("#artwork").attr("src", "./static/blank.jpg");
 			} else {
-				$("#artwork").attr("src", "data:image/jpeg;base64," + data.Picture);
+				$("#artwork").attr("src", "data:image/jpeg;base64," + btoa(String.fromCharCode(...new Uint8Array(data.Picture))));
 			}
 		},
 		error: function () {
@@ -59,23 +59,22 @@ function getNowPlayingAlbumArt() {
 	});
 }
 
-function getListenURL() {
+// getStreamURL fetches /api/streamurl which returns the configured public
+// stream URL (CSERVER_STREAMURL). This avoids exposing internal Docker
+// hostnames (e.g. icecast2:8000) to the browser.
+function getStreamURL() {
 	$.ajax({
 		type: "GET",
-		url: "/api/listenurl",
+		url: "/api/streamurl",
 		dataType: "json",
 		success: function (data) {
-			if (data.ListenURL == "-/-") {
+			if (!data.StreamURL || data.StreamURL === "") {
 				$("#status").html("Disconnected from server.");
 			} else {
-				streamSrcURL = location.protocol + "//" + data.ListenURL;
+				streamSrcURL = data.StreamURL;
 				document.getElementById("stream").src = streamSrcURL;
 				$("#status").html(
-					"Connected: <a href='" +
-						streamSrcURL +
-						"'>" +
-						streamSrcURL +
-						"</a>"
+					"Connected: <a href='" + streamSrcURL + "'>" + streamSrcURL + "</a>"
 				);
 			}
 		},
@@ -99,36 +98,24 @@ function getHistory() {
 				table += "<thead><tr><th>Ended</th><th>Artist</th><th>Title</th></tr></thead><tbody>"
 				data.reverse().forEach(function(song) {
 					var delta = Math.round((+(new Date()) - (new Date(String(song.Ended)))) / 1000);
-
-					var minute = 60
-					var hour = minute * 60
-					var day = hour * 24
-
+					var minute = 60, hour = minute * 60, day = hour * 24;
 					var timeAgo;
-
-					if (delta < 30) {
-						timeAgo = 'just now';
-					} else if (delta < minute) {
-						timeAgo = delta + ' seconds ago';
-					} else if (delta < 2 * minute) {
-						timeAgo = 'a minute ago'
-					} else if (delta < hour) {
-						timeAgo = Math.floor(delta / minute) + ' minutes ago';
-					} else if (Math.floor(delta / hour) == 1) {
-						timeAgo = '1 hour ago'
-					} else if (delta < day) {
-						timeAgo = Math.floor(delta / hour) + ' hours ago';
-					}
-
+					if (delta < 30) { timeAgo = 'just now'; }
+					else if (delta < minute) { timeAgo = delta + ' seconds ago'; }
+					else if (delta < 2 * minute) { timeAgo = 'a minute ago'; }
+					else if (delta < hour) { timeAgo = Math.floor(delta / minute) + ' minutes ago'; }
+					else if (Math.floor(delta / hour) == 1) { timeAgo = '1 hour ago'; }
+					else if (delta < day) { timeAgo = Math.floor(delta / hour) + ' hours ago'; }
+					else { timeAgo = Math.floor(delta / day) + ' days ago'; }
 					table += "<tr><td>" + timeAgo + "</td><td>" + song.Artist + "</td><td>" + song.Title + "</td></tr>";
 				})
-				table += "</tbody>"		
+				table += "</tbody>"
 				document.getElementById("historyStatus").innerHTML = "";
 			}
 			table += "</table>";
 			document.getElementById("historyResults").innerHTML = table;
 		},
-		error: function() {	
+		error: function() {
 			document.getElementById("historyStatus").innerHTML = "Error. Could not get history.";
 		}
 	});
@@ -142,30 +129,18 @@ function postSearch() {
 		url: "/api/search",
 		contentType: "application/json",
 		data: JSON.stringify(data),
-		dataType: "json", // expects a json response
+		dataType: "json",
 		success: function (data) {
-			var table =
-				"<table class='table is-striped is-hoverable' id='searchResults'>";
+			var table = "<table class='table is-striped is-hoverable' id='searchResults'>";
 			if (data === null) {
-				// if no results from search
-				document.getElementById("requestStatus").innerHTML =
-					"Results: 0";
-				var input = $("#searchInput").val();
-				input = input.replace(/</g, "&lt;").replace(/>/g, "&gt;"); // Encode < and >, for error when placed back into no-results message
+				document.getElementById("requestStatus").innerHTML = "Results: 0";
 			} else {
-				document.getElementById("requestStatus").innerHTML =
-					"Results: " + data.length;
-				table +=
-					"<thead><tr><th>Artist</th><th>Title</th><th>Availability</th></tr></thead><tbody>";
+				document.getElementById("requestStatus").innerHTML = "Results: " + data.length;
+				table += "<thead><tr><th>Artist</th><th>Title</th><th>Availability</th></tr></thead><tbody>";
 				data.forEach(function (song) {
-					table +=
-						"<tr><td>" +
-						song.Artist +
-						"</td><td>" +
-						song.Title +
+					table += "<tr><td>" + song.Artist + "</td><td>" + song.Title +
 						"</td><td><button class='button is-small is-light requestButton' data-id='" +
-						escape(song.ID) +
-						"'>Request</button></td></tr>";
+						escape(song.ID) + "'>Request</button></td></tr>";
 				});
 				table += "</tbody>";
 			}
@@ -173,8 +148,7 @@ function postSearch() {
 			document.getElementById("searchResults").innerHTML = table;
 		},
 		error: function () {
-			document.getElementById("requestStatus").innerHTML =
-				"Error. Could not execute search.";
+			document.getElementById("requestStatus").innerHTML = "Error. Could not execute search.";
 		},
 	});
 }
@@ -189,12 +163,10 @@ function postRequestID() {
 			contentType: "application/json",
 			data: JSON.stringify(data),
 			success: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Request accepted!";
+				document.getElementById("requestStatus").innerHTML = "Request accepted!";
 			},
 			error: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Sorry, your request was not accepted. You may be rate limited.";
+				document.getElementById("requestStatus").innerHTML = "Sorry, your request was not accepted. You may be rate limited.";
 			},
 		});
 	});
@@ -202,17 +174,17 @@ function postRequestID() {
 
 function connectRadioData() {
 	let eventSource = new EventSource("/api/radiodata/sse");
-	eventSource.onerror = function (event) {
+	eventSource.onerror = function () {
 		eventSource.close();
-		setTimeout(function () {
-			connectRadioData();
-		}, 10000);
+		setTimeout(connectRadioData, 10000);
 	}
 	eventSource.addEventListener("title", function(event) {
-		$('#song').text(event.data)
+		$('#song').text(event.data);
+		getNowPlayingAlbumArt();
+		getHistory();
 	})
 	eventSource.addEventListener("artist", function(event) {
-		$('#artist').text(event.data)
+		$('#artist').text(event.data);
 	})
 	eventSource.addEventListener("listeners", function(event) {
 		if (event.data == -1) {
@@ -221,24 +193,12 @@ function connectRadioData() {
 			$("#listeners").html(event.data);
 		}
 	})
-	eventSource.addEventListener("title" || "artist" || "history", function() {
-		getNowPlayingAlbumArt()
-		getHistory()
-	})
+	// listenurl SSE: only update status text, do NOT change audio src.
+	// The audio src is set once from /api/streamurl (CSERVER_STREAMURL).
 	eventSource.addEventListener("listenurl", function(event) {
 		if (event.data == "-/-") {
-			document.getElementById("stream").src = "";
 			$("#status").html("Disconnected from server.");
-		} else {
-			streamSrcURL = location.protocol + "//" + event.data;
-			document.getElementById("stream").src = streamSrcURL;
-			$("#status").html(
-				"Connected: <a href='" +
-					streamSrcURL +
-					"'>" +
-					streamSrcURL +
-					"</a>"
-			);
 		}
+		// else: stream URL already set from getStreamURL() on load
 	});
 }
