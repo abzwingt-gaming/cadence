@@ -1,143 +1,122 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Exit immediately upon error
-set -eo pipefail
+COLOR_GREEN='\033[0;32m'
+COLOR_YELLOW='\033[1;33m'
+COLOR_RED='\033[0;31m'
+COLOR_RESET='\033[0m'
 
-if [ $# -gt 0 ]
-then
-      echo "$(basename $0): No parameters allowed, $# given."
-      exit 1
-fi
+info()  { echo -e "${COLOR_GREEN}[cadence]${COLOR_RESET} $*"; }
+warn()  { echo -e "${COLOR_YELLOW}[warn]${COLOR_RESET}   $*"; }
+err()   { echo -e "${COLOR_RED}[error]${COLOR_RESET}  $*" >&2; }
 
-cat <<END
-"***************************************************************"
-NOTE: If you need help determining configuration values to use,
-installation documentation is available on GitHub:
-https://github.com/kenellorando/cadence/wiki/Installation
-***************************************************************
-
-[1/5] Path to Music Directory
-Set a path to a directory containing audio files (e.g. mp3, flac) to be played
-on the radio. The target will be recursively searched.
-END
-read -ep "      Music path: " CADENCE_PATH
-while [ ! -d "$CADENCE_PATH" ]
-do
-      echo "Music path must point to a directory that exists and is readable."
-      read -ep "      Music path: " CADENCE_PATH
-done
-# We do need to use absolute paths here - Make sure they end up that way.
-# realpath -s is used here instead of readlink -f to retain symlinks - Else,
-# we'd automatically go to the destination and use that, even if the user
-# changed the symlink and restarted Cadence!
-# ... Despite this, symlinks inside CADENCE_PATH probably won't work, since
-# they don't get mounted inside our containers. Not a lot we can do about that.
-CADENCE_PATH=$(realpath -s "$CADENCE_PATH")
-
+info "Cadence Homelab Installer"
 echo
 
-cat <<END
-[2/5] Stream Host Address
-Set the stream host address. This may be a DNS name, public IP, or private IP.
-Use localhost:8000 if your Cadence instance is meant for local use only.
-Default: localhost:8000
-END
-read -p "      Stream address: " CADENCE_STREAM_HOST
-if [ -z "$CADENCE_STREAM_HOST" ]
-then
-      echo "Streaming to localhost:8000."
-      CADENCE_STREAM_HOST='localhost:8000'
-fi
+# --- Checks ---
+command -v docker  >/dev/null 2>&1 || { err "Docker not found. Install Docker first."; exit 1; }
+command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1 || \
+  { err "Docker Compose not found."; exit 1; }
 
-
-echo
-
-cat <<END
-[3/5] Rate Limiter Timeout
-Set a rate limit timeout in integer seconds. This prevents the same listener
-from requesting songs within the configured timeframe. Set to 0 to disable.
-END
-read -p "      Rate limit (0): " CADENCE_RATE
-while ! [[ "$CADENCE_RATE" =~ ^[0-9]*$ ]]
-do
-      echo "Rate limit must be an integer!"
-      read -p "      Rate limit (0): " CADENCE_RATE
-done
-[ -z "$CADENCE_RATE" ] && CADENCE_RATE=0
-
-
-echo
-
-cat <<END
-[4/5] Radio Service Password
-Set a secure, unique service password. Input is hidden.
-END
-read -s -p "      Password: " CADENCE_PASS
-while [ -z "$CADENCE_PASS" ]
-do
-      echo
-      echo "Password cannot be empty!"
-      read -s -p "      Password: " CADENCE_PASS
-done
-
-echo
-echo
-
-cat <<END
-[5/5] Enable Reverse Proxy?
-Do you want to enable a reverse proxy? Skip if you are broadcasting locally only
-or have your own reverse proxy configured. Skip if you do not know what this means.
-END
-ENABLE_REVERSE_PROXY="UNSET"
-while ! [[ "$ENABLE_REVERSE_PROXY" =~ ^[yYnN]$ ]] && [ -n "$ENABLE_REVERSE_PROXY" ]
-do
-      read -n1 -p "      [y/N]: " ENABLE_REVERSE_PROXY
-      echo
-done
-
-if [[ "$ENABLE_REVERSE_PROXY" =~ ^([yY])$ ]]
-then
-      echo "Please provide the domain name you will use for Cadence UI."
-      read -p "      Web UI Domain: " CADENCE_WEB_HOST
-      while [ -z "$CADENCE_WEB_HOST" ]
-      do
-            echo "Web UI Domain cannot be empty!"
-            read -p "      Web UI Domain: " CADENCE_WEB_HOST
-      done
+# --- Config files ---
+if [ ! -f config/cadence.env ]; then
+  cp config/cadence.env.example config/cadence.env
+  info "Created config/cadence.env from example."
 else
-      echo "No reverse proxy will be configured."
+  info "config/cadence.env already exists, skipping."
 fi
 
-SCRIPT_DIR="$(dirname $(readlink -f $0))"
-cd $SCRIPT_DIR
+for f in icecast.xml liquidsoap.liq; do
+  if [ ! -f "config/$f" ]; then
+    cp "config/$f.example" "config/$f"
+    info "Created config/$f from example."
+  fi
+done
 
-cp ./config/cadence.env.example ./config/cadence.env
-cp ./config/icecast.xml.example ./config/icecast.xml
-cp ./config/liquidsoap.liq.example ./config/liquidsoap.liq
-cp ./config/nginx.conf.example ./config/nginx.conf
-
-if [[ "$ENABLE_REVERSE_PROXY" =~ ^([yY])$ ]]
-then
-      awk -v "c=$(cat ./nginx-compose-section.yml)" \
-          '{gsub(/NGINX_CONFIG_SECTION/,c)}1' ./docker-compose.yml.example > ./docker-compose.yml
-else
-      sed -e 's|NGINX_CONFIG_SECTION||g' ./docker-compose.yml.example > ./docker-compose.yml
+if [ ! -f config/Caddyfile ]; then
+  cp config/Caddyfile.example config/Caddyfile
+  info "Created config/Caddyfile from example."
 fi
 
-sed -i 's|CADENCE_PASS_EXAMPLE|'"$CADENCE_PASS"'|g' ./config/cadence.env
-sed -i 's|CADENCE_PASS_EXAMPLE|'"$CADENCE_PASS"'|g' ./config/icecast.xml
-sed -i 's|CADENCE_PASS_EXAMPLE|'"$CADENCE_PASS"'|g' ./config/liquidsoap.liq
-sed -i 's|CADENCE_RATE_EXAMPLE|'"$CADENCE_RATE"'|g' ./config/cadence.env
-sed -i 's|CADENCE_STREAM_HOST_EXAMPLE|'"$CADENCE_STREAM_HOST"'|g' ./config/icecast.xml
-sed -i 's|CADENCE_PATH_EXAMPLE|'"$CADENCE_PATH"'|g' ./config/cadence.env
-sed -i 's|CADENCE_PATH_EXAMPLE|'"$CADENCE_PATH"'|g' ./config/liquidsoap.liq
-sed -i 's|CADENCE_STREAM_HOST_EXAMPLE|'"$CADENCE_STREAM_HOST"'|g' ./config/nginx.conf
-sed -i 's|CADENCE_WEB_HOST_EXAMPLE|'"$CADENCE_WEB_HOST"'|g' ./config/nginx.conf
-sed -i 's|CADENCE_PATH_EXAMPLE|'"$CADENCE_PATH"'|g' ./docker-compose.yml
+# Ensure data dir exists for SQLite
+mkdir -p data
 
-echo ""
-echo "Configuration completed."
+# --- Interactive setup ---
+echo
+info "=== Quick Setup ==="
 
-docker compose down
-docker compose pull
-docker compose up
+read -rp "Music directory path [/music]: " MUSIC_DIR
+MUSIC_DIR=${MUSIC_DIR:-/music}
+
+echo
+echo "Database backend:"
+echo "  1) sqlite  - lightweight, no extra container (recommended for homelab)"
+echo "  2) postgres - full fuzzy search, requires more RAM"
+read -rp "Choice [1]: " DB_CHOICE
+DB_CHOICE=${DB_CHOICE:-1}
+
+case "$DB_CHOICE" in
+  2) DB_BACKEND=postgres ;;
+  *) DB_BACKEND=sqlite   ;;
+esac
+
+PROFILES=""
+PG_PASS=""
+if [ "$DB_BACKEND" = "postgres" ]; then
+  read -rsp "Postgres password: " PG_PASS; echo
+  PROFILES="--profile postgres"
+fi
+
+echo
+read -rp "Enable Redis rate limiting? (y/N): " USE_REDIS
+USE_REDIS=${USE_REDIS:-n}
+if [[ "$USE_REDIS" =~ ^[Yy]$ ]]; then
+  read -rsp "Redis password (leave blank for none): " REDIS_PASS; echo
+  PROFILES="$PROFILES --profile redis"
+  # Write REDIS_PASSWORD to env if set
+  if [ -n "${REDIS_PASS:-}" ]; then
+    echo "REDIS_PASSWORD=${REDIS_PASS}" >> config/cadence.env
+    sed -i "s|# CSERVER_REDISPASSWORD=|CSERVER_REDISPASSWORD=${REDIS_PASS}|" config/cadence.env
+  fi
+fi
+
+echo
+read -rp "Public stream URL (e.g. https://radio.example.com/cadence1) [leave blank to skip]: " PUBLIC_STREAM
+PUBLIC_STREAM=${PUBLIC_STREAM:-}
+
+# --- Write config ---
+sed -i "s|CSERVER_MUSIC_DIR=.*|CSERVER_MUSIC_DIR=${MUSIC_DIR}|"     config/cadence.env
+sed -i "s|CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND}|" config/cadence.env
+echo "MUSIC_DIR=${MUSIC_DIR}" >> config/cadence.env
+
+if [ -n "$PG_PASS" ]; then
+  sed -i "s|# POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"   config/cadence.env
+fi
+if [ -n "$PUBLIC_STREAM" ]; then
+  sed -i "s|CSERVER_PUBLIC_STREAM_URL=.*|CSERVER_PUBLIC_STREAM_URL=${PUBLIC_STREAM}|" config/cadence.env
+fi
+
+# --- Build & start ---
+echo
+info "Building images..."
+docker compose build
+
+info "Starting Cadence ($DB_BACKEND${PROFILES:+ + ${PROFILES// --profile /+}})..."
+# shellcheck disable=SC2086
+docker compose $PROFILES up -d
+
+echo
+info "Done! Cadence should be available at http://localhost:8080"
+if command -v curl >/dev/null 2>&1; then
+  sleep 3
+  if curl -sf http://localhost:8080/healthz | grep -q 'ok'; then
+    info "Health check passed."
+  else
+    warn "Health check returned degraded. Check: docker compose logs cadence"
+  fi
+fi
+echo
+info "Config:     config/cadence.env"
+info "Caddy:      config/Caddyfile.example"
+info "Custom CSS: src/server/public/css/custom.css (mounted, edit without rebuild)"
+info "Logs:       docker compose logs -f cadence"

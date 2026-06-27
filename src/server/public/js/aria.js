@@ -1,244 +1,155 @@
-var streamSrcURL = "";
+// aria.js - SSE listener, search, request, history.
 
-$(document).ready(function() {
-	getListenURL()
-	getHistory()
-	getNowPlayingMetadata()
-	getNowPlayingAlbumArt()
-	getVersion()
-	connectRadioData()
-	postSearch()
-	postRequestID()
+const API = {
+  search:   '/api/search',
+  reqId:    '/api/request/id',
+  reqBest:  '/api/request/bestmatch',
+  art:      '/api/nowplaying/albumart',
+  history:  '/api/history',
+  listenurl:'/api/listenurl',
+  sse:      '/api/radiodata/sse',
+  version:  '/api/version',
+  bitrate:  '/api/bitrate',
+};
+
+let streamSrcURL = '';
+
+// --- SSE ---
+const sse = new EventSource(API.sse);
+
+sse.addEventListener('title', e => {
+  document.getElementById('song').textContent = e.data;
+  fetchArt();
+});
+sse.addEventListener('artist', e => {
+  document.getElementById('artist').textContent = e.data;
+});
+sse.addEventListener('listenurl', e => {
+  streamSrcURL = e.data;
+  document.getElementById('status').textContent = 'Connected';
+  document.getElementById('status').className = 'nes-text is-success';
+});
+sse.addEventListener('listeners', e => {
+  updateInfo();
+});
+sse.addEventListener('bitrate', e => {
+  updateInfo();
+});
+sse.addEventListener('history', () => loadHistory());
+
+sse.onerror = () => {
+  document.getElementById('status').textContent = 'Waiting for stream...';
+  document.getElementById('status').className = 'nes-text is-warning';
+};
+
+// --- Info bar: listeners + bitrate ---
+function updateInfo() {
+  Promise.all([
+    fetch('/api/listeners').then(r => r.json()),
+    fetch(API.bitrate).then(r => r.json()),
+  ]).then(([l, b]) => {
+    const listeners = l.Listeners >= 0 ? l.Listeners : '?';
+    const bitrate   = b.Bitrate   >  0 ? b.Bitrate + ' kbps' : '';
+    document.getElementById('version').textContent =
+      'Listeners: ' + listeners + (bitrate ? '  ·  ' + bitrate : '');
+  }).catch(() => {});
+}
+
+// --- Version ---
+fetch(API.version).then(r => r.json()).then(d => {
+  document.getElementById('release').textContent = d.Version || 'dev';
+}).catch(() => {});
+
+// --- Album art ---
+function fetchArt() {
+  fetch(API.art).then(r => {
+    if (r.status === 204 || r.status === 404) {
+      document.getElementById('artwork').src = './static/blank.jpg';
+      return null;
+    }
+    return r.json();
+  }).then(d => {
+    if (d && d.Picture) {
+      document.getElementById('artwork').src = 'data:image/jpeg;base64,' + d.Picture;
+    }
+  }).catch(() => {
+    document.getElementById('artwork').src = './static/blank.jpg';
+  });
+}
+
+// --- Search (300ms debounce) ---
+let searchTimer;
+document.getElementById('searchInput').addEventListener('keyup', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => doSearch(e.target.value.trim()), 300);
 });
 
-function getVersion() {
-	$.ajax({
-		type: "GET",
-		url: "/api/version",
-		dataType: "json",
-		success: function (data) {
-			document.getElementById("release").innerHTML = data.Version;
-		},
-		error: function () {
-			document.getElementById("release").innerHTML = "(N/A)";
-		},
-	});
+function doSearch(q) {
+  if (!q) {
+    document.getElementById('searchResults').innerHTML = '';
+    return;
+  }
+  fetch(API.search, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search: q }),
+  }).then(r => r.json()).then(results => {
+    const el = document.getElementById('searchResults');
+    if (!results || results.length === 0) {
+      el.innerHTML = '<p class="nes-text">No results.</p>';
+      return;
+    }
+    el.innerHTML = results.map(s =>
+      `<div class="search-result nes-container" data-id="${s.ID}">
+        <span class="song-title">${s.Title}</span>
+        <span class="song-artist nes-text is-primary"> — ${s.Artist}</span>
+        <button class="nes-btn is-primary request-btn" data-id="${s.ID}">&#9654; Request</button>
+      </div>`
+    ).join('');
+    el.querySelectorAll('.request-btn').forEach(btn => {
+      btn.addEventListener('click', () => requestSong(btn.dataset.id));
+    });
+  }).catch(() => {
+    document.getElementById('searchResults').innerHTML = '<p class="nes-text is-error">Search error.</p>';
+  });
 }
 
-function getNowPlayingMetadata() {
-	$.ajax({
-		type: "GET",
-		url: "/api/nowplaying/metadata",
-		dataType: "json",
-		success: function (data) {
-			$("#song").text(data.Title);
-			$("#artist").text(data.Artist);
-		},
-		error: function () {
-			$("#song").text("-");
-			$("#artist").text("-");
-		},
-	});
+function requestSong(id) {
+  const statusEl = document.getElementById('requestStatus');
+  fetch(API.reqId, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ID: String(id) }),
+  }).then(r => {
+    if (r.status === 429) throw new Error('ratelimit');
+    if (!r.ok) throw new Error('fail');
+    statusEl.textContent = 'Requested!';
+    statusEl.className = 'nes-text is-success';
+  }).catch(err => {
+    statusEl.textContent = err.message === 'ratelimit'
+      ? 'Rate limited. Try again later.'
+      : 'Request failed.';
+    statusEl.className = 'nes-text is-error';
+  });
 }
 
-function getNowPlayingAlbumArt() {
-	$.ajax({
-		type: "GET",
-		url: "/api/nowplaying/albumart",
-		dataType: "json",
-		success: function (data) {
-			if (data == undefined) {
-				$("#artwork").attr("src", "./static/blank.jpg");
-			} else {
-				$("#artwork").attr("src", "data:image/jpeg;base64," + data.Picture);
-			}
-		},
-		error: function () {
-			$("#artwork").attr("src", "./static/blank.jpg");
-		},
-	});
+// --- History ---
+function loadHistory() {
+  fetch(API.history).then(r => r.json()).then(items => {
+    const el = document.getElementById('historyResults');
+    if (!items || items.length === 0) {
+      el.innerHTML = '<p class="nes-text">No history yet.</p>';
+      return;
+    }
+    el.innerHTML = [...items].reverse().map(h =>
+      `<div class="history-item nes-container">
+        <span class="song-title">${h.Title}</span>
+        <span class="song-artist nes-text is-primary"> — ${h.Artist}</span>
+      </div>`
+    ).join('');
+  }).catch(() => {});
 }
+loadHistory();
 
-function getListenURL() {
-	$.ajax({
-		type: "GET",
-		url: "/api/listenurl",
-		dataType: "json",
-		success: function (data) {
-			if (data.ListenURL == "-/-") {
-				$("#status").html("Disconnected from server.");
-			} else {
-				streamSrcURL = location.protocol + "//" + data.ListenURL;
-				document.getElementById("stream").src = streamSrcURL;
-				$("#status").html(
-					"Connected: <a href='" +
-						streamSrcURL +
-						"'>" +
-						streamSrcURL +
-						"</a>"
-				);
-			}
-		},
-		error: function () {
-			document.getElementById("stream").src = "";
-			$("#status").html("Disconnected from server.");
-		},
-	});
-}
-
-function getHistory() {
-	$.ajax({
-		type: 'GET',
-		url: "/api/history",
-		dataType: "json",
-		success: function(data) {
-			var table = "<table class='table is-striped' id='historyResults'>";
-			if (data.length === 0) {
-				document.getElementById("historyStatus").innerHTML = "No history available (yet).";
-			} else {
-				table += "<thead><tr><th>Ended</th><th>Artist</th><th>Title</th></tr></thead><tbody>"
-				data.reverse().forEach(function(song) {
-					var delta = Math.round((+(new Date()) - (new Date(String(song.Ended)))) / 1000);
-
-					var minute = 60
-					var hour = minute * 60
-					var day = hour * 24
-
-					var timeAgo;
-
-					if (delta < 30) {
-						timeAgo = 'just now';
-					} else if (delta < minute) {
-						timeAgo = delta + ' seconds ago';
-					} else if (delta < 2 * minute) {
-						timeAgo = 'a minute ago'
-					} else if (delta < hour) {
-						timeAgo = Math.floor(delta / minute) + ' minutes ago';
-					} else if (Math.floor(delta / hour) == 1) {
-						timeAgo = '1 hour ago'
-					} else if (delta < day) {
-						timeAgo = Math.floor(delta / hour) + ' hours ago';
-					}
-
-					table += "<tr><td>" + timeAgo + "</td><td>" + song.Artist + "</td><td>" + song.Title + "</td></tr>";
-				})
-				table += "</tbody>"		
-				document.getElementById("historyStatus").innerHTML = "";
-			}
-			table += "</table>";
-			document.getElementById("historyResults").innerHTML = table;
-		},
-		error: function() {	
-			document.getElementById("historyStatus").innerHTML = "Error. Could not get history.";
-		}
-	});
-}
-
-function postSearch() {
-	var data = {};
-	data.search = $("#searchInput").val();
-	$.ajax({
-		type: "POST",
-		url: "/api/search",
-		contentType: "application/json",
-		data: JSON.stringify(data),
-		dataType: "json", // expects a json response
-		success: function (data) {
-			var table =
-				"<table class='table is-striped is-hoverable' id='searchResults'>";
-			if (data === null) {
-				// if no results from search
-				document.getElementById("requestStatus").innerHTML =
-					"Results: 0";
-				var input = $("#searchInput").val();
-				input = input.replace(/</g, "&lt;").replace(/>/g, "&gt;"); // Encode < and >, for error when placed back into no-results message
-			} else {
-				document.getElementById("requestStatus").innerHTML =
-					"Results: " + data.length;
-				table +=
-					"<thead><tr><th>Artist</th><th>Title</th><th>Availability</th></tr></thead><tbody>";
-				data.forEach(function (song) {
-					table +=
-						"<tr><td>" +
-						song.Artist +
-						"</td><td>" +
-						song.Title +
-						"</td><td><button class='button is-small is-light requestButton' data-id='" +
-						escape(song.ID) +
-						"'>Request</button></td></tr>";
-				});
-				table += "</tbody>";
-			}
-			table += "</table>";
-			document.getElementById("searchResults").innerHTML = table;
-		},
-		error: function () {
-			document.getElementById("requestStatus").innerHTML =
-				"Error. Could not execute search.";
-		},
-	});
-}
-
-function postRequestID() {
-	$(document).on("click", ".requestButton", function (e) {
-		var data = {};
-		data.ID = unescape(this.dataset.id);
-		$.ajax({
-			type: "POST",
-			url: "/api/request/id",
-			contentType: "application/json",
-			data: JSON.stringify(data),
-			success: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Request accepted!";
-			},
-			error: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Sorry, your request was not accepted. You may be rate limited.";
-			},
-		});
-	});
-}
-
-function connectRadioData() {
-	let eventSource = new EventSource("/api/radiodata/sse");
-	eventSource.onerror = function (event) {
-		eventSource.close();
-		setTimeout(function () {
-			connectRadioData();
-		}, 10000);
-	}
-	eventSource.addEventListener("title", function(event) {
-		$('#song').text(event.data)
-	})
-	eventSource.addEventListener("artist", function(event) {
-		$('#artist').text(event.data)
-	})
-	eventSource.addEventListener("listeners", function(event) {
-		if (event.data == -1) {
-			$("#listeners").html("N/A");
-		} else {
-			$("#listeners").html(event.data);
-		}
-	})
-	eventSource.addEventListener("title" || "artist" || "history", function() {
-		getNowPlayingAlbumArt()
-		getHistory()
-	})
-	eventSource.addEventListener("listenurl", function(event) {
-		if (event.data == "-/-") {
-			document.getElementById("stream").src = "";
-			$("#status").html("Disconnected from server.");
-		} else {
-			streamSrcURL = location.protocol + "//" + event.data;
-			document.getElementById("stream").src = streamSrcURL;
-			$("#status").html(
-				"Connected: <a href='" +
-					streamSrcURL +
-					"'>" +
-					streamSrcURL +
-					"</a>"
-			);
-		}
-	});
-}
+// Initial info load
+updateInfo();
