@@ -18,6 +18,7 @@ import (
 
 var ctx = context.Background()
 var dbr = RedisClient{}
+var redisAvailable = false
 
 // redisAvailable is written once in redisInit and read concurrently from
 // HTTP handlers — must be atomic to avoid a data race.
