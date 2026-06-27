@@ -10,9 +10,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/dhowden/tag"
 )
+
+// rescanRunning prevents overlapping rescans triggered by /api/admin/rescan,
+// SIGHUP, or the filesystem watcher.
+var rescanRunning atomic.Bool
 
 func Search() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -123,22 +128,21 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 			return
 		}
 
-		type ArtResponse struct {
-			Picture string `json:"Picture"`
-		}
-
-		// 1. Try embedded tags
+		// 1. Try embedded tags — scoped in closure so defer fires immediately.
 		var encoded string
-		file, err := os.Open(path)
-		if err == nil {
-			defer file.Close()
-			tags, terr := tag.ReadFrom(file)
+		func() {
+			f, ferr := os.Open(path)
+			if ferr != nil {
+				return
+			}
+			defer f.Close()
+			tags, terr := tag.ReadFrom(f)
 			if terr == nil && tags.Picture() != nil {
 				encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
 			}
-		}
+		}()
 
-		// 2. Fallback: cover.jpg / folder.jpg in same directory
+		// 2. Fallback: cover.jpg / folder.jpg in same directory.
 		if encoded == "" {
 			if fallbackPath := ArtworkPath(path); fallbackPath != "" {
 				if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
@@ -153,9 +157,11 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 			return
 		}
 
-		res := ArtResponse{Picture: encoded}
-		jsonBytes, err := json.Marshal(res)
-		if err != nil {
+		type ArtResponse struct {
+			Picture string `json:"Picture"`
+		}
+		jsonBytes, merr := json.Marshal(ArtResponse{Picture: encoded})
+		if merr != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -167,8 +173,12 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 
 func History() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		historyMu.Lock()
+		snap := make([]playRecord, len(history))
+		copy(snap, history)
+		historyMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(history)
+		json.NewEncoder(w).Encode(snap)
 	}
 }
 
@@ -207,19 +217,23 @@ func Version() http.HandlerFunc {
 	}
 }
 
+// AdminRescan triggers a DB rescan. Only registered when CSERVER_DEVMODE=true.
+// Returns 202 immediately; 409 if a rescan is already in progress.
 func AdminRescan() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		if !rescanRunning.CompareAndSwap(false, true) {
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte("rescan already running"))
+			return
+		}
 		go func() {
+			defer rescanRunning.Store(false)
 			slog.Info("Manual rescan triggered via /api/admin/rescan.")
-			// Reset compiled patterns to pick up any env changes
-			titleCleanupRe = nil
-			titleCleanupOnce = sync.Once{}
-			artistCleanupRe = nil
-			artistCleanupOnce = sync.Once{}
+			resetCleanupRe()
 			if err := dbPopulate(); err != nil {
 				slog.Error("Rescan failed.", "error", err)
 			}
@@ -230,11 +244,7 @@ func AdminRescan() http.HandlerFunc {
 
 func Readyz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if dbActive == nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		if err := dbActive.Ping(); err != nil {
+		if dbActive == nil || dbActive.Ping() != nil {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -244,14 +254,14 @@ func Readyz() http.HandlerFunc {
 
 func Healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbOK      := dbActive != nil && dbActive.Ping() == nil
-		n         := NowSnapshot()
+		dbOK := dbActive != nil && dbActive.Ping() == nil
+		n := NowSnapshot()
 		icecastOK := n.Song.Title != "-" && n.Song.Title != ""
-		status    := "ok"
-		code      := http.StatusOK
+		status := "ok"
+		code := http.StatusOK
 		if !dbOK || !icecastOK {
 			status = "degraded"
-			code   = http.StatusServiceUnavailable
+			code = http.StatusServiceUnavailable
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
@@ -259,7 +269,7 @@ func Healthz() http.HandlerFunc {
 			"status":  status,
 			"db":      dbOK,
 			"icecast": icecastOK,
-			"redis":   redisAvailable,
+			"redis":   redisAvailable.Load(),
 			"version": c.Version,
 		})
 	}
@@ -274,6 +284,3 @@ func DevSkip() http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 	}
 }
-
-// sync.Once is needed in api.go for AdminRescan
-import "sync"
