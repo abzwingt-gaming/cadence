@@ -1,4 +1,4 @@
-// db.go - backend-agnostic DB helpers + tag extraction with title normalisation.
+// db.go - DB helpers, tag extraction, title/artist normalisation, artwork fallback.
 
 package main
 
@@ -23,35 +23,47 @@ var audioExtensions = map[string]bool{
 	".m4a": true, ".opus": true, ".wav": true, ".aac": true,
 }
 
-// compiled title cleanup patterns, built once at first populate.
-var titleCleanupRe []*regexp.Regexp
-var titleCleanupOnce sync.Once
+// Artwork fallback filenames checked in order when no embedded art exists.
+var artworkFallbackNames = []string{"cover.jpg", "cover.png", "folder.jpg", "folder.png", "album.jpg", "album.png"}
 
-func buildTitleCleanupRe() {
-	titleCleanupOnce.Do(func() {
-		for _, pat := range strings.Split(c.TitleCleanupPatterns, "|") {
-			pat = strings.TrimSpace(pat)
-			if pat == "" {
-				continue
-			}
-			re, err := regexp.Compile(pat)
-			if err != nil {
-				slog.Warn("Bad title cleanup pattern, skipping.", "pattern", pat, "error", err)
-				continue
-			}
-			titleCleanupRe = append(titleCleanupRe, re)
+var titleCleanupRe   []*regexp.Regexp
+var titleCleanupOnce sync.Once
+var artistCleanupRe   []*regexp.Regexp
+var artistCleanupOnce sync.Once
+
+func buildCleanupRe(patterns string, dest *[]*regexp.Regexp) {
+	for _, pat := range strings.Split(patterns, "|") {
+		pat = strings.TrimSpace(pat)
+		if pat == "" {
+			continue
 		}
-		slog.Info(fmt.Sprintf("Title cleanup: %d patterns loaded.", len(titleCleanupRe)))
-	})
+		re, err := regexp.Compile(pat)
+		if err != nil {
+			slog.Warn("Bad cleanup pattern, skipping.", "pattern", pat, "error", err)
+			continue
+		}
+		*dest = append(*dest, re)
+	}
+	slog.Info(fmt.Sprintf("Cleanup patterns loaded: %d.", len(*dest)))
 }
 
-// cleanTitle strips common yt-dlp suffixes and trims the result.
-func cleanTitle(s string) string {
-	for _, re := range titleCleanupRe {
+func buildTitleCleanupRe() {
+	titleCleanupOnce.Do(func() { buildCleanupRe(c.TitleCleanupPatterns, &titleCleanupRe) })
+}
+
+func buildArtistCleanupRe() {
+	artistCleanupOnce.Do(func() { buildCleanupRe(c.ArtistCleanupPatterns, &artistCleanupRe) })
+}
+
+func applyRe(s string, res []*regexp.Regexp) string {
+	for _, re := range res {
 		s = re.ReplaceAllString(s, "")
 	}
 	return strings.TrimSpace(s)
 }
+
+func cleanTitle(s string)  string { return applyRe(s, titleCleanupRe) }
+func cleanArtist(s string) string { return applyRe(s, artistCleanupRe) }
 
 func sanitize(s, fallback string) string {
 	s = strings.TrimSpace(s)
@@ -59,6 +71,19 @@ func sanitize(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// ArtworkPath returns embedded art from tags, or a fallback file path in the
+// same directory as audioPath. Returns "" if nothing found.
+func ArtworkPath(audioPath string) string {
+	dir := filepath.Dir(audioPath)
+	for _, name := range artworkFallbackNames {
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func searchByQuery(query string) ([]SongData, error) {
@@ -130,20 +155,21 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 
 func dbPopulate() error {
 	buildTitleCleanupRe()
+	buildArtistCleanupRe()
 
 	if c.MusicDir == "" {
 		slog.Warn("CSERVER_MUSIC_DIR not set, skipping populate.")
 		return nil
 	}
 	if _, err := os.Stat(c.MusicDir); err != nil {
-		slog.Error("Music directory not accessible.", "dir", c.MusicDir, "error", err)
+		slog.Error("Music dir not accessible.", "dir", c.MusicDir, "error", err)
 		return err
 	}
 
 	var files []string
 	err := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Warn("Walk error, skipping.", "path", path, "error", err)
+			slog.Warn("Walk error.", "path", path, "error", err)
 			return nil
 		}
 		if !info.IsDir() && audioExtensions[strings.ToLower(filepath.Ext(path))] {
@@ -159,7 +185,7 @@ func dbPopulate() error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	slog.Info(fmt.Sprintf("Scanning %d files with %d workers...", len(files), workers))
+	slog.Info(fmt.Sprintf("Scanning %d files, %d workers.", len(files), workers))
 
 	fileCh := make(chan string, len(files))
 	for _, f := range files {
@@ -200,13 +226,11 @@ func dbPopulate() error {
 	return nil
 }
 
-// extractTags reads ID3/Vorbis/MP4 tags. Always returns usable strings.
-// Applies title normalisation to clean yt-dlp-style suffixes.
 func extractTags(path string) (title, album, artist, genre, year string) {
-	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	title  = base
-	artist = "Unknown Artist"
-	album  = "Unknown Album"
+	base   := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	title   = cleanTitle(base)
+	artist  = "Unknown Artist"
+	album   = "Unknown Album"
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -218,12 +242,11 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
 		slog.Debug("Tag read failed, using filename.", "path", path)
-		title = cleanTitle(base)
 		return
 	}
 
 	title  = cleanTitle(sanitize(tags.Title(),  base))
-	artist = sanitize(tags.Artist(), "Unknown Artist")
+	artist = cleanArtist(sanitize(tags.Artist(), "Unknown Artist"))
 	album  = sanitize(tags.Album(),  "Unknown Album")
 	genre  = sanitize(tags.Genre(),  "")
 	if y := tags.Year(); y > 0 {

@@ -122,24 +122,38 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		file, err := os.Open(path)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		defer file.Close()
-
-		tags, err := tag.ReadFrom(file)
-		if err != nil || tags.Picture() == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
 
 		type ArtResponse struct {
 			Picture string `json:"Picture"`
 		}
-		encoded  := base64.StdEncoding.EncodeToString(tags.Picture().Data)
-		res      := ArtResponse{Picture: encoded}
+
+		// 1. Try embedded tags
+		var encoded string
+		file, err := os.Open(path)
+		if err == nil {
+			defer file.Close()
+			tags, terr := tag.ReadFrom(file)
+			if terr == nil && tags.Picture() != nil {
+				encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
+			}
+		}
+
+		// 2. Fallback: cover.jpg / folder.jpg in same directory
+		if encoded == "" {
+			if fallbackPath := ArtworkPath(path); fallbackPath != "" {
+				if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
+					encoded = base64.StdEncoding.EncodeToString(data)
+					slog.Debug("Artwork from fallback file.", "path", fallbackPath)
+				}
+			}
+		}
+
+		if encoded == "" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		res := ArtResponse{Picture: encoded}
 		jsonBytes, err := json.Marshal(res)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
@@ -193,8 +207,27 @@ func Version() http.HandlerFunc {
 	}
 }
 
-// Readyz is the liveness probe: returns 200 as soon as the process is up and DB connected.
-// Docker / Caddy should use this for health routing.
+func AdminRescan() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		go func() {
+			slog.Info("Manual rescan triggered via /api/admin/rescan.")
+			// Reset compiled patterns to pick up any env changes
+			titleCleanupRe = nil
+			titleCleanupOnce = sync.Once{}
+			artistCleanupRe = nil
+			artistCleanupOnce = sync.Once{}
+			if err := dbPopulate(); err != nil {
+				slog.Error("Rescan failed.", "error", err)
+			}
+		}()
+		w.WriteHeader(http.StatusAccepted)
+	}
+}
+
 func Readyz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if dbActive == nil {
@@ -209,15 +242,13 @@ func Readyz() http.HandlerFunc {
 	}
 }
 
-// Healthz is the readiness probe: returns full status of all dependencies.
-// Use for monitoring dashboards (Uptime Kuma, etc.), not for liveness.
 func Healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbOK     := dbActive != nil && dbActive.Ping() == nil
-		n        := NowSnapshot()
+		dbOK      := dbActive != nil && dbActive.Ping() == nil
+		n         := NowSnapshot()
 		icecastOK := n.Song.Title != "-" && n.Song.Title != ""
-		status   := "ok"
-		code     := http.StatusOK
+		status    := "ok"
+		code      := http.StatusOK
 		if !dbOK || !icecastOK {
 			status = "degraded"
 			code   = http.StatusServiceUnavailable
@@ -243,3 +274,6 @@ func DevSkip() http.HandlerFunc {
 		w.WriteHeader(http.StatusOK)
 	}
 }
+
+// sync.Once is needed in api.go for AdminRescan
+import "sync"

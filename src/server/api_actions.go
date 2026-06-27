@@ -1,10 +1,11 @@
 // api_actions.go
-// Icecast monitor, Liquidsoap telnet, filesystem watcher.
+// Icecast monitor, Liquidsoap HTTP/telnet, filesystem watcher.
 
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log/slog"
@@ -18,11 +19,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-var now     = RadioInfo{}
-var nowMu   sync.RWMutex
+var now   = RadioInfo{}
+var nowMu sync.RWMutex
 
-// artCache holds base64-encoded art keyed by song path, cleared on track change.
-var artCache   sync.Map
+var artCache    sync.Map
 var artCacheKey string
 
 type RadioInfo struct {
@@ -43,47 +43,89 @@ type SongData struct {
 	Path   string
 }
 
-// NowSnapshot returns a safe copy of now.
 func NowSnapshot() RadioInfo {
 	nowMu.RLock()
 	defer nowMu.RUnlock()
 	return now
 }
 
+// liquidsoapRequest pushes a path to Liquidsoap.
+// Mode: auto = try HTTP first, fall back to telnet.
 func liquidsoapRequest(path string) (string, error) {
-	conn, err := net.DialTimeout("tcp", c.LiquidsoapAddress+c.LiquidsoapPort, 5*time.Second)
-	if err != nil {
-		slog.Error("Liquidsoap connect failed.", "error", err)
-		return "", err
+	switch strings.ToLower(c.LiquidsoapMode) {
+	case "http":
+		return liquidsoapHTTP("request.push", path)
+	case "telnet":
+		return liquidsoapTelnet(fmt.Sprintf("request.push %s", path))
+	default: // auto
+		if msg, err := liquidsoapHTTP("request.push", path); err == nil {
+			return msg, nil
+		}
+		slog.Warn("Liquidsoap HTTP failed, falling back to telnet.")
+		return liquidsoapTelnet(fmt.Sprintf("request.push %s", path))
 	}
-	defer conn.Close()
-	fmt.Fprintf(conn, "request.push %s\n", path)
-	msg, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		slog.Error("Liquidsoap read failed.", "error", err)
-	}
-	fmt.Fprintf(conn, "quit\n")
-	slog.Info("Liquidsoap response.", "msg", strings.TrimSpace(msg))
-	return msg, nil
 }
 
 func liquidsoapSkip() (string, error) {
+	switch strings.ToLower(c.LiquidsoapMode) {
+	case "http":
+		return liquidsoapHTTP("cadence1.skip", "")
+	case "telnet":
+		return liquidsoapTelnet("cadence1.skip")
+	default:
+		if msg, err := liquidsoapHTTP("cadence1.skip", ""); err == nil {
+			return msg, nil
+		}
+		return liquidsoapTelnet("cadence1.skip")
+	}
+}
+
+// liquidsoapHTTP uses Liquidsoap 2.x HTTP harbor API.
+// Expects CSERVER_LIQUIDSOAPADDRESS:CSERVER_LIQUIDSOAP_HTTP_PORT to serve
+// the harbor endpoint at /api/<cmd>.
+func liquidsoapHTTP(cmd, arg string) (string, error) {
+	var body []byte
+	if arg != "" {
+		body = []byte(arg)
+	}
+	url := fmt.Sprintf("http://%s%s/api/%s",
+		c.LiquidsoapAddress, c.LiquidsoapHTTPPort, cmd)
+	resp, err := http.Post(url, "text/plain", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	res, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("liquidsoap HTTP %d: %s", resp.StatusCode, res)
+	}
+	slog.Info("Liquidsoap HTTP response.", "cmd", cmd, "resp", strings.TrimSpace(string(res)))
+	return string(res), nil
+}
+
+// liquidsoapTelnet is the classic telnet protocol (liquidsoap 2.x needs
+// server.telnet = true in the .liq script).
+func liquidsoapTelnet(cmd string) (string, error) {
 	conn, err := net.DialTimeout("tcp", c.LiquidsoapAddress+c.LiquidsoapPort, 5*time.Second)
 	if err != nil {
-		slog.Error("Liquidsoap connect failed.", "error", err)
+		slog.Error("Liquidsoap telnet connect failed.", "error", err)
 		return "", err
 	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "cadence1.skip\n")
+	fmt.Fprintf(conn, "%s\n", cmd)
 	msg, err := bufio.NewReader(conn).ReadString('\n')
 	if err != nil {
-		slog.Error("Liquidsoap skip read failed.", "error", err)
+		slog.Error("Liquidsoap telnet read failed.", "error", err)
 	}
 	fmt.Fprintf(conn, "quit\n")
+	slog.Info("Liquidsoap telnet response.", "cmd", cmd, "msg", strings.TrimSpace(msg))
 	return msg, nil
 }
 
 func filesystemMonitor() {
+	if c.MusicDir == "" {
+		return
+	}
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		slog.Error("fsnotify failed.", "error", err)
@@ -91,10 +133,9 @@ func filesystemMonitor() {
 	}
 	defer watcher.Close()
 	if err = watcher.Add(c.MusicDir); err != nil {
-		slog.Error("Cannot watch music dir.", "error", err)
+		slog.Error("Cannot watch music dir.", "dir", c.MusicDir, "error", err)
 		return
 	}
-	// Debounce: wait 3s after last event before repopulating
 	var debounce *time.Timer
 	for {
 		select {
@@ -179,7 +220,6 @@ func icecastMonitor() {
 
 		if prev.Song.Title != nowSnap.Song.Title || prev.Song.Artist != nowSnap.Song.Artist {
 			slog.Info("Now Playing.", "title", nowSnap.Song.Title, "artist", nowSnap.Song.Artist)
-			// Invalidate art cache
 			artCache = sync.Map{}
 			if redisAvailable {
 				dbr.RateLimitArt.FlushDB(ctx)
@@ -199,7 +239,6 @@ func icecastMonitor() {
 			}
 		}
 
-		// Public stream URL: prefer CSERVER_PUBLIC_STREAM_URL, fallback to Icecast host/mountpoint
 		publicStream := c.PublicStreamURL
 		if publicStream == "" {
 			publicStream = nowSnap.Host + "/" + nowSnap.Mountpoint
@@ -209,6 +248,9 @@ func icecastMonitor() {
 		}
 		if prev.Listeners != nowSnap.Listeners {
 			radiodata_sse.SendEventMessage(fmt.Sprint(nowSnap.Listeners), "listeners", "")
+		}
+		if prev.Bitrate != nowSnap.Bitrate {
+			radiodata_sse.SendEventMessage(fmt.Sprint(nowSnap.Bitrate), "bitrate", "")
 		}
 		prev = nowSnap
 	}

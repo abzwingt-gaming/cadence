@@ -23,10 +23,11 @@ func routes() *http.ServeMux {
 	r.Handle("/api/listeners",           Listeners())
 	r.Handle("/api/bitrate",             Bitrate())
 	r.Handle("/api/version",             Version())
-	r.Handle("/readyz",                  Readyz())  // liveness: DB up
-	r.Handle("/healthz",                 Healthz()) // readiness: DB + Icecast + Redis
+	r.Handle("/readyz",                  Readyz())
+	r.Handle("/healthz",                 Healthz())
 	if c.DevMode {
-		r.Handle("/api/dev/skip", DevSkip())
+		r.Handle("/api/dev/skip",        DevSkip())
+		r.Handle("/api/admin/rescan",    AdminRescan())
 	}
 	r.Handle("/", http.FileServer(http.Dir(c.RootPath+"./public/")))
 	return r
