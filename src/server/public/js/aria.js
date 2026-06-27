@@ -1,5 +1,5 @@
-// aria.js - SSE listener, search, request, history.
-// Loaded after page.js; depends on DOM already being ready.
+// aria.js — SSE listener, search, request, history.
+// Loaded after page.js.
 
 const API = {
   search:    '/api/search',
@@ -14,8 +14,11 @@ const API = {
   listeners: '/api/listeners',
 };
 
-// Must be var so page.js can guard `typeof streamSrcURL === 'undefined'`.
+// var so page.js can check `typeof streamSrcURL`.
 var streamSrcURL = '';
+
+const VOLUME_KEY    = 'cadence_volume';
+const SEARCH_MIN    = 2;
 
 // ── SSE ──────────────────────────────────────────────────────
 const sse = new EventSource(API.sse);
@@ -29,19 +32,21 @@ sse.addEventListener('artist', e => {
 });
 sse.addEventListener('listenurl', e => {
   streamSrcURL = e.data;
-  document.getElementById('status').textContent = 'Connected';
-  document.getElementById('status').className = 'nes-text is-success';
+  const st = document.getElementById('status');
+  st.textContent = 'Connected';
+  st.className   = 'nes-text is-success';
 });
 sse.addEventListener('listeners', () => scheduleInfoUpdate());
 sse.addEventListener('bitrate',   () => scheduleInfoUpdate());
 sse.addEventListener('history',   () => loadHistory());
 
 sse.onerror = () => {
-  document.getElementById('status').textContent = 'Waiting for stream...';
-  document.getElementById('status').className = 'nes-text is-warning';
+  const st = document.getElementById('status');
+  st.textContent = 'Waiting for stream...';
+  st.className   = 'nes-text is-warning';
 };
 
-// ── Info bar: listeners + bitrate (debounced) ─────────────────
+// ── Info bar ─────────────────────────────────────────────────
 let _infoTimer = null;
 function scheduleInfoUpdate() {
   if (_infoTimer) return;
@@ -53,10 +58,9 @@ function updateInfo() {
     fetch(API.listeners).then(r => r.json()),
     fetch(API.bitrate).then(r => r.json()),
   ]).then(([l, b]) => {
-    const listeners = (l.Listeners >= 0) ? l.Listeners : '?';
-    const bitrate   = (b.Bitrate   >  0) ? b.Bitrate + ' kbps' : '';
-    document.getElementById('listeners').textContent =
-      'Listeners: ' + listeners + (bitrate ? '  \xb7  ' + bitrate : '');
+    const n = (l.Listeners >= 0) ? l.Listeners : '?';
+    const br = (b.Bitrate > 0) ? ' \xb7 ' + b.Bitrate + ' kbps' : '';
+    document.getElementById('listeners').textContent = '\u{1F464} ' + n + br;
   }).catch(() => {});
 }
 
@@ -74,23 +78,19 @@ function fetchArt() {
     }
     return r.json();
   }).then(d => {
-    if (d && d.Picture) {
+    if (d && d.Picture)
       document.getElementById('artwork').src = 'data:image/*;base64,' + d.Picture;
-    }
   }).catch(() => {
     document.getElementById('artwork').src = './static/blank.jpg';
   });
 }
 
-// ── Search (300ms debounce, 2-char minimum) ───────────────────
-const SEARCH_MIN_LEN = 2;
-const VOLUME_KEY = 'cadence_volume'; // shared with page.js
-
+// ── Search ────────────────────────────────────────────────────
 let searchTimer;
-document.getElementById('searchInput').addEventListener('keyup', e => {
+document.getElementById('searchInput').addEventListener('input', e => {
   clearTimeout(searchTimer);
   const q = e.target.value.trim();
-  if (q.length < SEARCH_MIN_LEN) {
+  if (q.length < SEARCH_MIN) {
     document.getElementById('searchResults').innerHTML = '';
     return;
   }
@@ -98,7 +98,7 @@ document.getElementById('searchInput').addEventListener('keyup', e => {
 });
 
 function doSearch(q) {
-  if (!q || q.length < SEARCH_MIN_LEN) {
+  if (!q || q.length < SEARCH_MIN) {
     document.getElementById('searchResults').innerHTML = '';
     return;
   }
@@ -114,36 +114,33 @@ function doSearch(q) {
     }
     el.innerHTML = '';
     results.forEach(s => {
-      const div = document.createElement('div');
-      div.className = 'search-result nes-container';
+      const div    = document.createElement('div');
+      div.className = 'search-result';
       div.setAttribute('role', 'listitem');
-      div.dataset.id = s.ID;
 
-      const title = document.createElement('span');
-      title.className = 'song-title';
+      const title  = document.createElement('span');
+      title.className   = 'song-title';
       title.textContent = s.Title;
 
-      const sep = document.createTextNode(' \u2014 ');
-
       const artist = document.createElement('span');
-      artist.className = 'song-artist nes-text is-primary';
+      artist.className   = 'song-artist';
       artist.textContent = s.Artist;
 
       const btn = document.createElement('button');
       btn.className = 'nes-btn is-primary request-btn';
       btn.dataset.id = s.ID;
       btn.setAttribute('aria-label', 'Request ' + s.Title + ' by ' + s.Artist);
-      btn.innerHTML = '&#9654; Request';
-      btn.addEventListener('click', () => requestSong(btn.dataset.id));
+      btn.textContent = '\u25B6 Request';
+      btn.addEventListener('click', () => requestSong(String(s.ID)));
 
       div.appendChild(title);
-      div.appendChild(sep);
       div.appendChild(artist);
       div.appendChild(btn);
       el.appendChild(div);
     });
   }).catch(() => {
-    document.getElementById('searchResults').innerHTML = '<p class="nes-text is-error">Search error.</p>';
+    document.getElementById('searchResults').innerHTML =
+      '<p class="nes-text is-error">Search error.</p>';
   });
 }
 
@@ -155,21 +152,21 @@ function requestSong(id) {
   fetch(API.reqId, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ID: String(id) }),
+    body: JSON.stringify({ ID: id }),
   }).then(r => {
     if (r.status === 429) throw new Error('ratelimit');
     if (!r.ok) throw new Error('fail');
-    statusEl.textContent = 'Requested!';
-    statusEl.className = 'nes-text is-success';
+    statusEl.textContent = '\u2713 Requested!';
+    statusEl.className   = 'nes-text is-success';
   }).catch(err => {
     statusEl.textContent = err.message === 'ratelimit'
-      ? 'Rate limited. Try again later.'
-      : 'Request failed.';
+      ? '\u26A0 Rate limited. Try again later.'
+      : '\u2717 Request failed.';
     statusEl.className = 'nes-text is-error';
   }).finally(() => {
     _reqClearTimer = setTimeout(() => {
       statusEl.textContent = '';
-      statusEl.className = '';
+      statusEl.className   = '';
     }, 4000);
   });
 }
@@ -178,13 +175,12 @@ function requestSong(id) {
 function formatEnded(iso) {
   if (!iso) return '';
   try {
-    const d = new Date(iso);
-    const diffMs  = Date.now() - d.getTime();
-    const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 1)  return 'just now';
-    if (diffMin < 60) return diffMin + 'm ago';
+    const d       = new Date(iso);
+    const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
+    if (diffMin <  1)  return 'just now';
+    if (diffMin < 60)  return diffMin + 'm ago';
     const diffH = Math.floor(diffMin / 60);
-    if (diffH  < 24) return diffH + 'h ago';
+    if (diffH   < 24)  return diffH + 'h ago';
     return d.toLocaleDateString();
   } catch (_) { return ''; }
 }
@@ -193,52 +189,46 @@ function loadHistory() {
   fetch(API.history).then(r => r.json()).then(items => {
     const el = document.getElementById('historyResults');
     if (!items || items.length === 0) {
-      el.innerHTML = '<p class="nes-text">No history yet.</p>';
+      el.innerHTML = '<p class="nes-text hint-text">No history yet.</p>';
       return;
     }
     el.innerHTML = '';
     [...items].reverse().forEach(h => {
-      const div = document.createElement('div');
-      div.className = 'history-item nes-container';
+      const div    = document.createElement('div');
+      div.className = 'history-item';
       div.setAttribute('role', 'listitem');
 
-      const title = document.createElement('span');
-      title.className = 'song-title';
+      const title  = document.createElement('span');
+      title.className   = 'song-title';
       title.textContent = h.Title;
 
-      const sep = document.createTextNode(' \u2014 ');
-
       const artist = document.createElement('span');
-      artist.className = 'song-artist nes-text is-primary';
+      artist.className   = 'song-artist';
       artist.textContent = h.Artist;
 
       div.appendChild(title);
-      div.appendChild(sep);
       div.appendChild(artist);
 
       const ended = formatEnded(h.Ended);
       if (ended) {
         const ts = document.createElement('span');
-        ts.className = 'history-ts';
-        ts.textContent = '(' + ended + ')';
+        ts.className   = 'history-ts';
+        ts.textContent = ended;
         div.appendChild(ts);
       }
-
       el.appendChild(div);
     });
   }).catch(() => {});
 }
 loadHistory();
 
-// ── Volume persistence ────────────────────────────────────────
-// page.js already restores volume on load; this wires the aria.js-side
-// save so both scripts write to the same key.
-(function initVolume() {
-  const volEl = document.getElementById('volume');
-  if (!volEl) return;
-  // page.js already set the initial value; skip re-reading here.
-  volEl.addEventListener('input', () => {
-    try { localStorage.setItem(VOLUME_KEY, volEl.value); } catch (_) {}
+// ── Volume save (aria.js side) ────────────────────────────────
+// page.js owns the initial restore; we just persist on change here.
+(function () {
+  const vol = document.getElementById('volume');
+  if (!vol) return;
+  vol.addEventListener('input', () => {
+    try { localStorage.setItem(VOLUME_KEY, vol.value); } catch (_) {}
   });
 })();
 
@@ -248,9 +238,8 @@ document.addEventListener('keydown', e => {
   const tag = (document.activeElement || {}).tagName;
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
   e.preventDefault();
-  const btn = document.getElementById('playButton');
-  if (btn) btn.click();
+  document.getElementById('playButton').click();
 });
 
-// Initial info load
+// Initial load
 updateInfo();

@@ -1,27 +1,39 @@
-/* main.css - Base styles. Override with custom.css (mounted volume). */
+/* main.css — Cadence Radio base styles.
+   Override anything here via the mounted custom.css volume. */
 
-/* ── Design tokens ─────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   Design tokens
+   ═══════════════════════════════════════════════════════════ */
 :root {
-  --bg:        #fff;
-  --fg:        #212529;
-  --card-bg:   #f8f8f8;
-  --border:    #aaa;
-  --muted:     #666;
-  --art-size:  min(50vw, 240px);
-  --gap:       16px;
-  --radius:    4px;
-  --transition: 0.18s ease;
+  --bg:         #fff;
+  --fg:         #212529;
+  --fg2:        #555;       /* secondary text */
+  --card-bg:    #f4f4f4;
+  --card-bg2:   #eaeaea;
+  --border:     #bbb;
+  --accent:     #209cee;    /* NES.css is-primary blue */
+  --accent2:    #92cc41;    /* NES.css is-success green */
+  --muted:      #666;
+  --art-size:   min(48vw, 220px);
+  --gap:        16px;
+  --radius:     0px;        /* keep pixel-art square look */
+  --transition: 0.15s ease;
+  --header-h:   48px;
 }
 
 [data-theme="dark"] {
   --bg:       #0d0d0d;
-  --fg:       #e8e8e8;
-  --card-bg:  #1a1a1a;
-  --border:   #444;
-  --muted:    #999;
+  --fg:       #e0e0e0;
+  --fg2:      #aaa;
+  --card-bg:  #161616;
+  --card-bg2: #1e1e1e;
+  --border:   #3a3a3a;
+  --muted:    #888;
 }
 
-/* ── Reset ─────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   Reset + helpers
+   ═══════════════════════════════════════════════════════════ */
 *, *::before, *::after { box-sizing: border-box; }
 
 .sr-only {
@@ -30,39 +42,121 @@
   clip: rect(0,0,0,0); white-space: nowrap; border-width: 0;
 }
 
-/* ── Base ──────────────────────────────────────────────────── */
-html, body {
+.section-label {
+  font-size: 0.65em;
+  letter-spacing: 0.15em;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.hint-text {
+  font-size: 0.65em;
+  color: var(--muted);
+}
+
+kbd {
+  display: inline-block;
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  font-family: inherit;
+  font-size: 0.85em;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Base
+   ═══════════════════════════════════════════════════════════ */
+html {
   background: var(--bg);
   color: var(--fg);
+}
+
+body {
   font-family: 'Press Start 2P', monospace;
   font-size: 10px;
   margin: 0;
   padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
   transition: background var(--transition), color var(--transition);
 }
 
-body {
-  padding: var(--gap);
-  max-width: 860px;
-  margin: 0 auto;
+/* ═══════════════════════════════════════════════════════════
+   Header
+   ═══════════════════════════════════════════════════════════ */
+#site-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--gap);
+  height: var(--header-h);
+  background: var(--card-bg);
+  border-bottom: 3px solid var(--border);
+  transition: background var(--transition), border-color var(--transition);
 }
 
-/* ── Player card ───────────────────────────────────────────── */
-#player {
-  margin-top: var(--gap);
+#site-title {
+  font-size: 1.0em;
+  letter-spacing: 0.05em;
+}
+
+#header-right {
   display: flex;
-  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+}
+
+/* Listeners badge in header */
+#listeners {
+  font-size: 0.75em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Main content
+   ═══════════════════════════════════════════════════════════ */
+#app {
+  flex: 1;
+  max-width: 860px;
+  width: 100%;
+  margin: 0 auto;
+  padding: var(--gap);
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Player card
+   ═══════════════════════════════════════════════════════════ */
+#player {
+  display: grid;
+  grid-template-columns: var(--art-size) 1fr;
   gap: var(--gap);
-  align-items: flex-start;
+  align-items: start;
+  margin-bottom: var(--gap);
+  padding: var(--gap) !important; /* override NES.css padding */
+}
+
+/* ── Artwork ────────────────────────────────────────────── */
+#artworkwrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 #artworkcontainer {
-  flex-shrink: 0;
   width: var(--art-size);
   height: var(--art-size);
   border: 3px solid var(--border);
-  background: var(--card-bg);
+  background: var(--card-bg2);
   overflow: hidden;
+  flex-shrink: 0;
   transition: border-color var(--transition);
 }
 
@@ -70,34 +164,110 @@ body {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  /* Fade in when src changes */
+  display: block;
   transition: opacity 0.3s ease;
 }
+#artwork.loading { opacity: 0.35; }
 
-/* Briefly dim artwork while new art loads */
-#artwork.loading { opacity: 0.4; }
-
-#playerinfo {
-  flex: 1;
-  min-width: 200px;
+/* ── Pixel pulse bar ────────────────────────────────────── */
+#pulse-bar {
   display: flex;
-  flex-direction: column;
-  gap: 8px;
+  gap: 3px;
+  height: 18px;
+  align-items: flex-end;
+  padding: 0 2px;
+  opacity: 0.3;         /* idle: dim */
+  transition: opacity 0.4s ease;
 }
 
-#song   { font-size: 1.2em; line-height: 1.6; word-break: break-word; }
-#artist { font-size: 1.0em; word-break: break-word; }
+body.is-playing #pulse-bar { opacity: 1; }
+
+.pulse-block {
+  flex: 1;
+  background: var(--accent);
+  border-radius: 1px;
+  height: 30%;
+  animation: none;
+  transition: height 0.2s ease;
+}
+
+body.is-playing .pulse-block {
+  animation: pulse-dance 0.8s ease-in-out infinite alternate;
+}
+
+body.is-playing .pulse-block:nth-child(1) { animation-delay: 0.00s; }
+body.is-playing .pulse-block:nth-child(2) { animation-delay: 0.10s; }
+body.is-playing .pulse-block:nth-child(3) { animation-delay: 0.20s; }
+body.is-playing .pulse-block:nth-child(4) { animation-delay: 0.30s; }
+body.is-playing .pulse-block:nth-child(5) { animation-delay: 0.25s; }
+body.is-playing .pulse-block:nth-child(6) { animation-delay: 0.15s; }
+body.is-playing .pulse-block:nth-child(7) { animation-delay: 0.05s; }
+body.is-playing .pulse-block:nth-child(8) { animation-delay: 0.35s; }
+
+@keyframes pulse-dance {
+  0%   { height: 20%; }
+  100% { height: 95%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse-block { animation: none !important; }
+}
+
+/* ── Player info column ─────────────────────────────────── */
+#playerinfo {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0; /* prevent grid blowout */
+}
+
+#nowplaying-label { margin-bottom: -4px; }
+
+/* Song title — clamp to 3 lines, no marquee needed for desktop */
+#song {
+  font-size: 1.15em;
+  line-height: 1.7;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+#artist {
+  font-size: 0.9em;
+  word-break: break-word;
+  color: var(--accent);
+}
+
+/* ── Play row ───────────────────────────────────────────── */
+#playrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
 
 #playButton {
-  cursor: pointer;
-  width: 80px;
-  text-align: center;
-  /* Override NES.css default so it's visibly a button */
+  min-width: 72px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 4px;
 }
 
+#copyStream {
+  font-size: 1.2em;
+  padding: 4px 8px !important;
+  line-height: 1;
+}
+
+#copyFeedback {
+  font-size: 0.7em;
+  color: var(--accent2);
+}
+
+/* ── Volume row ─────────────────────────────────────────── */
 #volumerow {
   display: flex;
   align-items: center;
@@ -106,87 +276,139 @@ body {
 
 #volume { flex: 1; cursor: pointer; }
 
-/* Fix stale selector: was #version, renamed to #listeners */
-#status, #listeners { font-size: 0.75em; opacity: 0.8; }
-
-/* ── Controls row ──────────────────────────────────────────── */
-#controls {
-  margin: 12px 0;
+#volDisplay {
+  font-size: 0.7em;
+  color: var(--muted);
+  min-width: 3em;
   text-align: right;
 }
 
-/* ── Tabs ──────────────────────────────────────────────────── */
-#tabs ul {
+/* ── Status row ─────────────────────────────────────────── */
+#statusrow { display: flex; align-items: center; gap: 8px; }
+#status    { font-size: 0.75em; }
+
+/* ═══════════════════════════════════════════════════════════
+   Tabs
+   ═══════════════════════════════════════════════════════════ */
+#tabs {
   display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  padding: 0;
-  list-style: none;
-  margin: var(--gap) 0 8px;
+  gap: 0;
+  border-bottom: 3px solid var(--border);
+  margin-bottom: var(--gap);
 }
 
-#tab-content section[role="tabpanel"] { display: none; }
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 3px solid transparent;
+  margin-bottom: -3px;  /* overlap the container border */
+  padding: 8px 14px;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 0.85em;
+  color: var(--muted);
+  transition: color var(--transition), border-color var(--transition);
+}
+
+.tab-btn:hover  { color: var(--fg); }
+.tab-btn.active { color: var(--fg); border-bottom-color: var(--accent); }
+
+#tab-content section[role="tabpanel"]         { display: none; }
 #tab-content section[role="tabpanel"].is-active { display: block; }
 
-/* ── Search ────────────────────────────────────────────────── */
-.nes-field { margin: 8px 0; }
+/* ═══════════════════════════════════════════════════════════
+   Search
+   ═══════════════════════════════════════════════════════════ */
+#searchrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+#searchClear {
+  flex-shrink: 0;
+  padding: 4px 10px !important;
+  font-size: 1.1em;
+  line-height: 1;
+}
+
+#searchHint {
+  margin-bottom: 8px;
+  min-height: 1.5em;
+}
 
 #searchResults,
 #historyResults {
-  margin-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 8px;
+  margin-top: 4px;
 }
 
-/* Search result cards */
-.search-result {
+/* ── Result / history cards ─────────────────────────────── */
+.search-result,
+.history-item {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  padding: 8px !important; /* tighter than NES.css default */
+  padding: 10px 12px;
   background: var(--card-bg);
   border: 2px solid var(--border);
-  transition: border-color var(--transition);
+  transition: border-color var(--transition), background var(--transition);
 }
-.search-result:hover { border-color: var(--fg); }
 
-.song-title  { font-size: 0.9em; flex: 1; min-width: 0; word-break: break-word; }
-.song-artist { font-size: 0.85em; }
+.search-result:hover { border-color: var(--fg); background: var(--card-bg2); }
 
-.request-btn { flex-shrink: 0; font-size: 0.8em !important; }
+.song-title {
+  font-size: 0.9em;
+  flex: 1;
+  min-width: 120px;
+  word-break: break-word;
+  line-height: 1.6;
+}
 
-/* ── History ───────────────────────────────────────────────── */
-.history-item {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px;
-  padding: 8px !important;
-  background: var(--card-bg);
-  border: 2px solid var(--border);
+.song-artist {
+  font-size: 0.8em;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.request-btn {
+  flex-shrink: 0;
+  font-size: 0.75em !important;
+  padding: 4px 10px !important;
+  margin-left: auto;
 }
 
 .history-ts {
-  font-size: 0.75em;
+  font-size: 0.7em;
   color: var(--muted);
   white-space: nowrap;
+  margin-left: auto;
 }
 
-/* ── Footer ────────────────────────────────────────────────── */
-footer {
-  margin-top: 32px;
-  padding: var(--gap);
-  font-size: 0.75em;
+/* ═══════════════════════════════════════════════════════════
+   Footer
+   ═══════════════════════════════════════════════════════════ */
+#site-footer {
+  padding: 10px var(--gap);
+  font-size: 0.7em;
   display: flex;
   justify-content: space-between;
+  align-items: center;
   flex-wrap: wrap;
   gap: 8px;
-  border-top: 2px solid var(--border);
+  border-top: 3px solid var(--border);
+  background: var(--card-bg);
+  color: var(--muted);
+  transition: background var(--transition), border-color var(--transition);
 }
 
-/* ── NES.css dark overrides ────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════
+   NES.css dark mode overrides
+   ═══════════════════════════════════════════════════════════ */
 [data-theme="dark"] .nes-container {
   background: var(--card-bg);
   color: var(--fg);
@@ -199,37 +421,63 @@ footer {
 }
 [data-theme="dark"] .nes-input,
 [data-theme="dark"] .nes-textarea {
-  background: #111;
+  background: #0d0d0d;
   color: var(--fg);
+  border-color: var(--border);
 }
 [data-theme="dark"] .nes-btn {
-  background: #222;
+  background: var(--card-bg2);
   color: var(--fg);
 }
+[data-theme="dark"] .nes-btn.is-primary  { background: #006bb3; }
+[data-theme="dark"] .nes-btn.is-success  { background: #3a7d12; }
+[data-theme="dark"] .nes-btn.is-error    { background: #8b1a2e; }
+[data-theme="dark"] .nes-btn.is-warning  { background: #7a5000; }
 
-/* ── Mobile ────────────────────────────────────────────────── */
-@media (max-width: 480px) {
-  :root { --art-size: min(80vw, 200px); }
+/* NES.css is-small modifier (not in 2.3.0 — we add it) */
+.nes-btn.is-small {
+  padding: 2px 6px !important;
+  font-size: 0.8em !important;
+}
 
-  body { padding: 10px; }
+/* ═══════════════════════════════════════════════════════════
+   Mobile  ≤ 540px
+   ═══════════════════════════════════════════════════════════ */
+@media (max-width: 540px) {
+  :root { --art-size: min(72vw, 200px); }
 
-  /* Stack artwork above player info on small screens */
+  /* Single column player on mobile */
   #player {
-    flex-direction: column;
-    align-items: center;
+    grid-template-columns: 1fr;
+    justify-items: center;
   }
 
-  #artworkcontainer { align-self: center; }
+  #artworkwrap  { width: var(--art-size); }
+  #playerinfo   { width: 100%; }
 
-  #playerinfo { min-width: 0; width: 100%; }
+  #playButton   { flex: 1; }
+  #copyStream   { flex-shrink: 0; }
 
-  /* Full-width play button on mobile */
-  #playButton { width: 100%; }
+  /* Song title: single line marquee on mobile */
+  #song {
+    -webkit-line-clamp: 2;
+    font-size: 1.0em;
+  }
 
-  /* Tabs scroll horizontally if they overflow */
-  #tabs ul { flex-wrap: nowrap; overflow-x: auto; }
+  /* Tab strip: scroll if buttons overflow */
+  #tabs { overflow-x: auto; }
 
-  /* Stack request button below song info on small cards */
+  /* Search card: stack title and button vertically */
   .search-result { flex-direction: column; align-items: flex-start; }
-  .request-btn { align-self: flex-end; }
+  .request-btn   { align-self: flex-end; margin-left: 0; }
+  .history-ts    { margin-left: 0; }
+
+  #site-footer .hint-text { display: none; } /* hide keyboard hint on touch */
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Tablet  541px – 760px
+   ═══════════════════════════════════════════════════════════ */
+@media (min-width: 541px) and (max-width: 760px) {
+  :root { --art-size: min(38vw, 200px); }
 }

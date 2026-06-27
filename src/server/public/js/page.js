@@ -1,29 +1,42 @@
-// page.js - UI interaction: play/pause, volume, tabs, theme.
-// Runs before aria.js; DOM is guaranteed by DOMContentLoaded.
+// page.js — UI interaction: play/pause, volume, tabs, theme, copy stream, search clear.
+// Loaded before aria.js; DOM ready via DOMContentLoaded.
 
 document.addEventListener('DOMContentLoaded', () => {
   const stream  = document.getElementById('stream');
   const volbar  = document.getElementById('volume');
+  const volDisp = document.getElementById('volDisplay');
   const playBtn = document.getElementById('playButton');
 
   // ── Volume ────────────────────────────────────────────────
-  // Key must match aria.js ('cadence_volume') so both scripts share the same value.
   const VOLUME_KEY = 'cadence_volume';
   const savedVol = parseFloat(localStorage.getItem(VOLUME_KEY) ?? '0.3');
-  volbar.value = String(isNaN(savedVol) ? 0.3 : savedVol);
-  stream.volume = isNaN(savedVol) ? 0.3 : savedVol;
+  const initVol  = isNaN(savedVol) ? 0.3 : Math.min(1, Math.max(0, savedVol));
+  volbar.value   = String(initVol);
+  stream.volume  = initVol;
+  if (volDisp) volDisp.textContent = Math.round(initVol * 100) + '%';
 
   volbar.addEventListener('input', () => {
     const v = parseFloat(volbar.value);
     stream.volume = v;
+    if (volDisp) volDisp.textContent = Math.round(v * 100) + '%';
     try { localStorage.setItem(VOLUME_KEY, String(v)); } catch (_) {}
   });
 
   // ── Play / Pause ──────────────────────────────────────────
+  function setPlaying(playing) {
+    if (playing) {
+      playBtn.innerHTML = '&#9646;&#9646; Pause';
+      playBtn.setAttribute('aria-label', 'Pause stream');
+      document.body.classList.add('is-playing');
+    } else {
+      playBtn.innerHTML = '&#9654; Play';
+      playBtn.setAttribute('aria-label', 'Play stream');
+      document.body.classList.remove('is-playing');
+    }
+  }
+
   playBtn.addEventListener('click', () => {
     if (stream.paused) {
-      // streamSrcURL is set by the SSE 'listenurl' event (aria.js).
-      // Guard against clicking play before the stream URL has arrived.
       if (typeof streamSrcURL === 'undefined' || !streamSrcURL) {
         const st = document.getElementById('status');
         st.textContent = 'Stream URL not yet received — please wait...';
@@ -33,16 +46,46 @@ document.addEventListener('DOMContentLoaded', () => {
       stream.src = streamSrcURL;
       stream.load();
       stream.play().catch(() => {});
-      playBtn.innerHTML = '&#9646;&#9646;';
-      playBtn.setAttribute('aria-label', 'Pause stream');
+      setPlaying(true);
     } else {
       stream.src = '';
       stream.load();
       stream.pause();
-      playBtn.innerHTML = '&#9654;';
-      playBtn.setAttribute('aria-label', 'Play stream');
+      setPlaying(false);
     }
   });
+
+  // Sync play state if browser pauses the stream (e.g. network error).
+  stream.addEventListener('pause',  () => setPlaying(false));
+  stream.addEventListener('playing', () => setPlaying(true));
+
+  // ── Copy stream URL ───────────────────────────────────────
+  const copyBtn = document.getElementById('copyStream');
+  const copyFb  = document.getElementById('copyFeedback');
+  let   copyTimer = null;
+
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => {
+      const url = (typeof streamSrcURL !== 'undefined' && streamSrcURL)
+        ? streamSrcURL
+        : window.location.origin; // fallback
+      navigator.clipboard.writeText(url).then(() => {
+        if (copyFb) { copyFb.textContent = 'Copied!'; }
+        clearTimeout(copyTimer);
+        copyTimer = setTimeout(() => { if (copyFb) copyFb.textContent = ''; }, 2500);
+      }).catch(() => {
+        if (copyFb) { copyFb.textContent = 'Failed'; }
+      });
+    });
+  }
+
+  // ── Artwork fade-in ───────────────────────────────────────
+  const artwork = document.getElementById('artwork');
+  if (artwork) {
+    artwork.addEventListener('loadstart', () => artwork.classList.add('loading'));
+    artwork.addEventListener('load',      () => artwork.classList.remove('loading'));
+    artwork.addEventListener('error',     () => artwork.classList.remove('loading'));
+  }
 
   // ── Tabs ──────────────────────────────────────────────────
   const tabBtns     = document.querySelectorAll('.tab-btn');
@@ -51,50 +94,62 @@ document.addEventListener('DOMContentLoaded', () => {
   tabBtns.forEach(btn => {
     btn.addEventListener('click', () => {
       tabBtns.forEach(b => {
-        b.classList.remove('active', 'is-primary');
+        b.classList.remove('active');
         b.setAttribute('aria-selected', 'false');
       });
       tabSections.forEach(s => {
         s.classList.remove('is-active');
         s.hidden = true;
       });
-      btn.classList.add('active', 'is-primary');
+      btn.classList.add('active');
       btn.setAttribute('aria-selected', 'true');
       const target = document.getElementById('tab-' + btn.dataset.tab);
-      if (target) {
-        target.classList.add('is-active');
-        target.hidden = false;
-      }
+      if (target) { target.classList.add('is-active'); target.hidden = false; }
     });
   });
 
-  // ── Theme ─────────────────────────────────────────────────
-  // Priority: 1) localStorage (user explicit), 2) prefers-color-scheme, 3) dark.
-  const html = document.documentElement;
-  const saved = localStorage.getItem('theme');
-  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-  html.setAttribute('data-theme', saved || (systemDark ? 'dark' : 'light'));
+  // ── Search clear button ───────────────────────────────────
+  const searchInput = document.getElementById('searchInput');
+  const searchClear = document.getElementById('searchClear');
+  const searchHint  = document.getElementById('searchHint');
 
-  document.getElementById('themeToggle').addEventListener('click', () => {
-    const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-    html.setAttribute('data-theme', next);
-    try { localStorage.setItem('theme', next); } catch (_) {}
-  });
-
-  // React to OS theme changes only when user hasn't overridden manually.
-  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
-    if (!localStorage.getItem('theme')) {
-      html.setAttribute('data-theme', e.matches ? 'dark' : 'light');
-    }
-  });
-
-  // ── Album art fade-in ─────────────────────────────────────
-  // aria.js calls fetchArt() on title change; we hook the img events here
-  // so the loading dim + fade-in works regardless of where src is set.
-  const artwork = document.getElementById('artwork');
-  if (artwork) {
-    artwork.addEventListener('loadstart', () => artwork.classList.add('loading'));
-    artwork.addEventListener('load',      () => artwork.classList.remove('loading'));
-    artwork.addEventListener('error',     () => artwork.classList.remove('loading'));
+  if (searchInput && searchClear) {
+    searchInput.addEventListener('input', () => {
+      const hasVal = searchInput.value.length > 0;
+      searchClear.hidden = !hasVal;
+      if (searchHint) searchHint.style.display = searchInput.value.length >= 2 ? 'none' : '';
+    });
+    searchClear.addEventListener('click', () => {
+      searchInput.value = '';
+      searchClear.hidden = true;
+      document.getElementById('searchResults').innerHTML = '';
+      if (searchHint) searchHint.style.display = '';
+      searchInput.focus();
+    });
   }
+
+  // ── Theme ─────────────────────────────────────────────────
+  const html    = document.documentElement;
+  const themeBtn = document.getElementById('themeToggle');
+
+  function applyTheme(t) {
+    html.setAttribute('data-theme', t);
+    if (themeBtn) themeBtn.textContent = t === 'dark' ? '\u2600' : '\u263D';
+  }
+
+  const saved     = localStorage.getItem('theme');
+  const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  applyTheme(saved || (systemDark ? 'dark' : 'light'));
+
+  if (themeBtn) {
+    themeBtn.addEventListener('click', () => {
+      const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      applyTheme(next);
+      try { localStorage.setItem('theme', next); } catch (_) {}
+    });
+  }
+
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+    if (!localStorage.getItem('theme')) applyTheme(e.matches ? 'dark' : 'light');
+  });
 });
