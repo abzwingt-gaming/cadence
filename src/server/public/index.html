@@ -4,9 +4,12 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <title>Cadence Radio</title>
   <meta name="description" content="Self-hosted web radio">
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+  <link rel="apple-touch-icon" href="/static/favicon.ico">
   <!-- NES.css -->
   <link href="https://unpkg.com/nes.css@2.3.0/css/nes.min.css" rel="stylesheet">
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
@@ -20,50 +23,52 @@
   <div id="player" class="nes-container with-title is-centered">
     <p class="title">Now Playing</p>
     <div id="artworkcontainer">
-      <img id="artwork" src="./static/blank.jpg" alt="Album Art"/>
+      <!-- blank.jpg shown until SSE delivers album art -->
+      <img id="artwork" src="./static/blank.jpg" alt="Album art for the current track" width="240" height="240" loading="eager">
     </div>
     <div id="playerinfo">
-      <!-- audio/mpeg is the correct MIME for MP3; audio/mp3 is non-standard -->
-      <audio id="stream" src="" type="audio/mpeg"></audio>
-      <div id="song" class="nes-text">-</div>
-      <div id="artist" class="nes-text is-primary">-</div>
-      <div id="playButton" class="nes-btn is-primary">&#9654;</div>
+      <!-- preload=none: don't buffer until user presses play -->
+      <audio id="stream" src="" preload="none" type="audio/mpeg"></audio>
+      <div id="song" class="nes-text" aria-live="polite" aria-label="Now playing title">-</div>
+      <div id="artist" class="nes-text is-primary" aria-live="polite" aria-label="Now playing artist">-</div>
+      <button id="playButton" class="nes-btn is-primary" aria-label="Play stream">&#9654;</button>
       <div id="volumerow">
-        <span class="nes-text">Vol</span>
-        <input type="range" id="volume" class="nes-progress" value=".3" min="0" max="1" step="0.006">
+        <label for="volume" class="nes-text">Vol</label>
+        <input type="range" id="volume" class="nes-progress" value=".3" min="0" max="1" step="0.006" aria-label="Volume">
       </div>
-      <div id="status" class="nes-text is-disabled">Connecting...</div>
-      <div id="listeners">Listeners: -</div>
+      <div id="status" class="nes-text is-disabled" role="status" aria-live="polite">Connecting...</div>
+      <div id="listeners" aria-live="polite">Listeners: -</div>
     </div>
   </div>
   <div id="controls">
-    <button id="themeToggle" class="nes-btn">&#9790; / &#9788;</button>
+    <button id="themeToggle" class="nes-btn" aria-label="Toggle light/dark theme">&#9790; / &#9788;</button>
   </div>
-  <div id="tabs">
+  <div id="tabs" role="tablist">
     <ul class="nes-list">
-      <li><button class="nes-btn is-primary tab-btn active" data-tab="request">Request</button></li>
-      <li><button class="nes-btn tab-btn" data-tab="history">History</button></li>
+      <li><button class="nes-btn is-primary tab-btn active" data-tab="request" role="tab" aria-selected="true" aria-controls="tab-request">Request</button></li>
+      <li><button class="nes-btn tab-btn" data-tab="history" role="tab" aria-selected="false" aria-controls="tab-history">History</button></li>
     </ul>
   </div>
   <div id="tab-content">
-    <section data-content="request" class="is-active">
+    <section id="tab-request" data-content="request" class="is-active" role="tabpanel" aria-label="Song request">
       <div class="nes-field">
-        <input name="searchInput" id="searchInput" class="nes-input" type="text" placeholder="Search song or artist...">
+        <label for="searchInput" class="sr-only">Search song or artist</label>
+        <input name="searchInput" id="searchInput" class="nes-input" type="search" placeholder="Search song or artist..." autocomplete="off" spellcheck="false">
       </div>
-      <div id="searchResults"></div>
-      <div id="requestStatus" class="nes-text"></div>
+      <div id="searchResults" role="list" aria-label="Search results"></div>
+      <div id="requestStatus" class="nes-text" role="status" aria-live="polite"></div>
     </section>
-    <section data-content="history">
-      <div id="historyResults"></div>
+    <section id="tab-history" data-content="history" role="tabpanel" aria-label="Play history" hidden>
+      <div id="historyResults" role="list" aria-label="Play history"></div>
       <div id="historyStatus" class="nes-text"></div>
     </section>
   </div>
 </main>
 <footer class="nes-container">
   <span>Cadence Radio <span id="release">-</span></span>
-  <a class="nes-text is-primary" target="_blank" href="https://github.com/abzwingt-gaming/cadence">Source</a>
+  <a class="nes-text is-primary" target="_blank" rel="noopener noreferrer" href="https://github.com/abzwingt-gaming/cadence">Source</a>
 </footer>
-<script src="./js/aria.js"></script>
 <script src="./js/page.js"></script>
+<script src="./js/aria.js"></script>
 </body>
 </html>

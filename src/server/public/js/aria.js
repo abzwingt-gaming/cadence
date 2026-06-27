@@ -1,28 +1,23 @@
 // aria.js - SSE listener, search, request, history.
+// Loaded after page.js; depends on DOM already being ready.
 
 const API = {
-  search:   '/api/search',
-  reqId:    '/api/request/id',
-  reqBest:  '/api/request/bestmatch',
-  art:      '/api/nowplaying/albumart',
-  history:  '/api/history',
-  listenurl:'/api/listenurl',
-  sse:      '/api/radiodata/sse',
-  version:  '/api/version',
-  bitrate:  '/api/bitrate',
-  listeners:'/api/listeners',
+  search:    '/api/search',
+  reqId:     '/api/request/id',
+  reqBest:   '/api/request/bestmatch',
+  art:       '/api/nowplaying/albumart',
+  history:   '/api/history',
+  listenurl: '/api/listenurl',
+  sse:       '/api/radiodata/sse',
+  version:   '/api/version',
+  bitrate:   '/api/bitrate',
+  listeners: '/api/listeners',
 };
 
-let streamSrcURL = '';
+// Must be var so page.js can guard `typeof streamSrcURL === 'undefined'`.
+var streamSrcURL = '';
 
-// esc() prevents XSS when inserting user-controlled strings into innerHTML.
-function esc(str) {
-  const d = document.createElement('div');
-  d.appendChild(document.createTextNode(String(str)));
-  return d.innerHTML;
-}
-
-// --- SSE ---
+// ── SSE ──────────────────────────────────────────────────────
 const sse = new EventSource(API.sse);
 
 sse.addEventListener('title', e => {
@@ -46,14 +41,11 @@ sse.onerror = () => {
   document.getElementById('status').className = 'nes-text is-warning';
 };
 
-// --- Info bar: listeners + bitrate (debounced to avoid fetch storms) ---
+// ── Info bar: listeners + bitrate (debounced) ─────────────────
 let _infoTimer = null;
 function scheduleInfoUpdate() {
   if (_infoTimer) return;
-  _infoTimer = setTimeout(() => {
-    _infoTimer = null;
-    updateInfo();
-  }, 300);
+  _infoTimer = setTimeout(() => { _infoTimer = null; updateInfo(); }, 300);
 }
 
 function updateInfo() {
@@ -63,21 +55,19 @@ function updateInfo() {
   ]).then(([l, b]) => {
     const listeners = (l.Listeners >= 0) ? l.Listeners : '?';
     const bitrate   = (b.Bitrate   >  0) ? b.Bitrate + ' kbps' : '';
-    // Update the #listeners element (renamed from #version in a previous fix).
     document.getElementById('listeners').textContent =
       'Listeners: ' + listeners + (bitrate ? '  \xb7  ' + bitrate : '');
   }).catch(() => {});
 }
 
-// --- Version ---
+// ── Version ───────────────────────────────────────────────────
 fetch(API.version).then(r => r.json()).then(d => {
   document.getElementById('release').textContent = d.Version || 'dev';
 }).catch(() => {});
 
-// --- Album art ---
+// ── Album art ─────────────────────────────────────────────────
 function fetchArt() {
   fetch(API.art).then(r => {
-    // 204 = no art found; 404 = song not in DB; 503 = stream idle.
     if (r.status === 204 || r.status === 404 || r.status === 503) {
       document.getElementById('artwork').src = './static/blank.jpg';
       return null;
@@ -85,7 +75,6 @@ function fetchArt() {
     return r.json();
   }).then(d => {
     if (d && d.Picture) {
-      // Use image/* so PNG covers aren't forced through a JPEG decoder.
       document.getElementById('artwork').src = 'data:image/*;base64,' + d.Picture;
     }
   }).catch(() => {
@@ -93,13 +82,14 @@ function fetchArt() {
   });
 }
 
-// --- Search (300ms debounce, 2-char minimum) ---
+// ── Search (300ms debounce, 2-char minimum) ───────────────────
 const SEARCH_MIN_LEN = 2;
+const VOLUME_KEY = 'cadence_volume'; // shared with page.js
+
 let searchTimer;
 document.getElementById('searchInput').addEventListener('keyup', e => {
   clearTimeout(searchTimer);
   const q = e.target.value.trim();
-  // Clear results immediately when input is too short.
   if (q.length < SEARCH_MIN_LEN) {
     document.getElementById('searchResults').innerHTML = '';
     return;
@@ -122,14 +112,14 @@ function doSearch(q) {
       el.innerHTML = '<p class="nes-text">No results.</p>';
       return;
     }
-    // Build DOM nodes instead of innerHTML to prevent XSS.
     el.innerHTML = '';
     results.forEach(s => {
       const div = document.createElement('div');
       div.className = 'search-result nes-container';
+      div.setAttribute('role', 'listitem');
       div.dataset.id = s.ID;
 
-      const title  = document.createElement('span');
+      const title = document.createElement('span');
       title.className = 'song-title';
       title.textContent = s.Title;
 
@@ -142,6 +132,7 @@ function doSearch(q) {
       const btn = document.createElement('button');
       btn.className = 'nes-btn is-primary request-btn';
       btn.dataset.id = s.ID;
+      btn.setAttribute('aria-label', 'Request ' + s.Title + ' by ' + s.Artist);
       btn.innerHTML = '&#9654; Request';
       btn.addEventListener('click', () => requestSong(btn.dataset.id));
 
@@ -156,6 +147,7 @@ function doSearch(q) {
   });
 }
 
+// ── Request ───────────────────────────────────────────────────
 let _reqClearTimer = null;
 function requestSong(id) {
   const statusEl = document.getElementById('requestStatus');
@@ -175,7 +167,6 @@ function requestSong(id) {
       : 'Request failed.';
     statusEl.className = 'nes-text is-error';
   }).finally(() => {
-    // Auto-clear status message after 4 seconds.
     _reqClearTimer = setTimeout(() => {
       statusEl.textContent = '';
       statusEl.className = '';
@@ -183,18 +174,17 @@ function requestSong(id) {
   });
 }
 
-// --- History ---
+// ── History ───────────────────────────────────────────────────
 function formatEnded(iso) {
   if (!iso) return '';
   try {
     const d = new Date(iso);
-    // Relative time if within 24 h, otherwise locale date.
-    const diffMs = Date.now() - d.getTime();
+    const diffMs  = Date.now() - d.getTime();
     const diffMin = Math.floor(diffMs / 60000);
     if (diffMin < 1)  return 'just now';
     if (diffMin < 60) return diffMin + 'm ago';
     const diffH = Math.floor(diffMin / 60);
-    if (diffH < 24)   return diffH + 'h ago';
+    if (diffH  < 24) return diffH + 'h ago';
     return d.toLocaleDateString();
   } catch (_) { return ''; }
 }
@@ -206,11 +196,11 @@ function loadHistory() {
       el.innerHTML = '<p class="nes-text">No history yet.</p>';
       return;
     }
-    // Build DOM nodes to prevent XSS from song metadata.
     el.innerHTML = '';
     [...items].reverse().forEach(h => {
       const div = document.createElement('div');
       div.className = 'history-item nes-container';
+      div.setAttribute('role', 'listitem');
 
       const title = document.createElement('span');
       title.className = 'song-title';
@@ -226,13 +216,11 @@ function loadHistory() {
       div.appendChild(sep);
       div.appendChild(artist);
 
-      // Timestamp: show when the track ended.
       const ended = formatEnded(h.Ended);
       if (ended) {
         const ts = document.createElement('span');
         ts.className = 'history-ts';
-        ts.textContent = ' (' + ended + ')';
-        ts.style.cssText = 'opacity:0.55;font-size:0.8em;margin-left:0.4em';
+        ts.textContent = '(' + ended + ')';
         div.appendChild(ts);
       }
 
@@ -242,22 +230,19 @@ function loadHistory() {
 }
 loadHistory();
 
-// --- Volume persistence ---
-// Restore saved volume on load; save on change.
+// ── Volume persistence ────────────────────────────────────────
+// page.js already restores volume on load; this wires the aria.js-side
+// save so both scripts write to the same key.
 (function initVolume() {
   const volEl = document.getElementById('volume');
   if (!volEl) return;
-  try {
-    const saved = localStorage.getItem('cadence_volume');
-    if (saved !== null) volEl.value = saved;
-  } catch (_) {}
+  // page.js already set the initial value; skip re-reading here.
   volEl.addEventListener('input', () => {
-    try { localStorage.setItem('cadence_volume', volEl.value); } catch (_) {}
+    try { localStorage.setItem(VOLUME_KEY, volEl.value); } catch (_) {}
   });
 })();
 
-// --- Keyboard shortcut: Space bar → play/pause ---
-// Only fires when focus is NOT inside the search input.
+// ── Space bar: play/pause ─────────────────────────────────────
 document.addEventListener('keydown', e => {
   if (e.code !== 'Space') return;
   const tag = (document.activeElement || {}).tagName;

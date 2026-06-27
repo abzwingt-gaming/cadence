@@ -1,22 +1,36 @@
 /* main.css - Base styles. Override with custom.css (mounted volume). */
 
+/* ── Design tokens ─────────────────────────────────────────── */
 :root {
-  --bg: #fff;
-  --fg: #212529;
-  --card-bg: #f8f8f8;
-  --border: #aaa;
-  --art-size: min(50vw, 240px);
+  --bg:        #fff;
+  --fg:        #212529;
+  --card-bg:   #f8f8f8;
+  --border:    #aaa;
+  --muted:     #666;
+  --art-size:  min(50vw, 240px);
+  --gap:       16px;
+  --radius:    4px;
+  --transition: 0.18s ease;
 }
 
 [data-theme="dark"] {
-  --bg: #0d0d0d;
-  --fg: #e8e8e8;
-  --card-bg: #1a1a1a;
-  --border: #444;
+  --bg:       #0d0d0d;
+  --fg:       #e8e8e8;
+  --card-bg:  #1a1a1a;
+  --border:   #444;
+  --muted:    #999;
 }
 
+/* ── Reset ─────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0,0,0,0); white-space: nowrap; border-width: 0;
+}
+
+/* ── Base ──────────────────────────────────────────────────── */
 html, body {
   background: var(--bg);
   color: var(--fg);
@@ -24,20 +38,21 @@ html, body {
   font-size: 10px;
   margin: 0;
   padding: 0;
-  transition: background 0.2s, color 0.2s;
+  transition: background var(--transition), color var(--transition);
 }
 
 body {
-  padding: 16px;
+  padding: var(--gap);
   max-width: 860px;
   margin: 0 auto;
 }
 
+/* ── Player card ───────────────────────────────────────────── */
 #player {
-  margin-top: 16px;
+  margin-top: var(--gap);
   display: flex;
   flex-wrap: wrap;
-  gap: 16px;
+  gap: var(--gap);
   align-items: flex-start;
 }
 
@@ -48,13 +63,19 @@ body {
   border: 3px solid var(--border);
   background: var(--card-bg);
   overflow: hidden;
+  transition: border-color var(--transition);
 }
 
 #artwork {
   width: 100%;
   height: 100%;
   object-fit: cover;
+  /* Fade in when src changes */
+  transition: opacity 0.3s ease;
 }
+
+/* Briefly dim artwork while new art loads */
+#artwork.loading { opacity: 0.4; }
 
 #playerinfo {
   flex: 1;
@@ -64,13 +85,17 @@ body {
   gap: 8px;
 }
 
-#song   { font-size: 1.2em; line-height: 1.6; }
-#artist { font-size: 1.0em; }
+#song   { font-size: 1.2em; line-height: 1.6; word-break: break-word; }
+#artist { font-size: 1.0em; word-break: break-word; }
 
 #playButton {
   cursor: pointer;
   width: 80px;
   text-align: center;
+  /* Override NES.css default so it's visibly a button */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 #volumerow {
@@ -79,53 +104,89 @@ body {
   gap: 8px;
 }
 
-#volume { flex: 1; }
+#volume { flex: 1; cursor: pointer; }
 
-#status, #version { font-size: 0.75em; opacity: 0.8; }
+/* Fix stale selector: was #version, renamed to #listeners */
+#status, #listeners { font-size: 0.75em; opacity: 0.8; }
 
+/* ── Controls row ──────────────────────────────────────────── */
 #controls {
   margin: 12px 0;
   text-align: right;
 }
 
+/* ── Tabs ──────────────────────────────────────────────────── */
 #tabs ul {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 0;
   list-style: none;
-  margin: 16px 0 8px;
+  margin: var(--gap) 0 8px;
 }
 
-#tab-content section { display: none; }
-#tab-content section.is-active { display: block; }
+#tab-content section[role="tabpanel"] { display: none; }
+#tab-content section[role="tabpanel"].is-active { display: block; }
 
+/* ── Search ────────────────────────────────────────────────── */
 .nes-field { margin: 8px 0; }
 
-#searchResults, #historyResults {
+#searchResults,
+#historyResults {
   margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85em;
+/* Search result cards */
+.search-result {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px !important; /* tighter than NES.css default */
+  background: var(--card-bg);
+  border: 2px solid var(--border);
+  transition: border-color var(--transition);
 }
-th, td {
-  text-align: left;
-  padding: 6px 8px;
-  border-bottom: 1px solid var(--border);
+.search-result:hover { border-color: var(--fg); }
+
+.song-title  { font-size: 0.9em; flex: 1; min-width: 0; word-break: break-word; }
+.song-artist { font-size: 0.85em; }
+
+.request-btn { flex-shrink: 0; font-size: 0.8em !important; }
+
+/* ── History ───────────────────────────────────────────────── */
+.history-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  padding: 8px !important;
+  background: var(--card-bg);
+  border: 2px solid var(--border);
 }
 
+.history-ts {
+  font-size: 0.75em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* ── Footer ────────────────────────────────────────────────── */
 footer {
   margin-top: 32px;
-  padding: 16px;
+  padding: var(--gap);
   font-size: 0.75em;
   display: flex;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
   border-top: 2px solid var(--border);
 }
 
-/* NES.css dark overrides */
+/* ── NES.css dark overrides ────────────────────────────────── */
 [data-theme="dark"] .nes-container {
   background: var(--card-bg);
   color: var(--fg);
@@ -139,9 +200,36 @@ footer {
 [data-theme="dark"] .nes-input,
 [data-theme="dark"] .nes-textarea {
   background: #111;
-  color: #e8e8e8;
+  color: var(--fg);
 }
 [data-theme="dark"] .nes-btn {
   background: #222;
-  color: #e8e8e8;
+  color: var(--fg);
+}
+
+/* ── Mobile ────────────────────────────────────────────────── */
+@media (max-width: 480px) {
+  :root { --art-size: min(80vw, 200px); }
+
+  body { padding: 10px; }
+
+  /* Stack artwork above player info on small screens */
+  #player {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  #artworkcontainer { align-self: center; }
+
+  #playerinfo { min-width: 0; width: 100%; }
+
+  /* Full-width play button on mobile */
+  #playButton { width: 100%; }
+
+  /* Tabs scroll horizontally if they overflow */
+  #tabs ul { flex-wrap: nowrap; overflow-x: auto; }
+
+  /* Stack request button below song info on small cards */
+  .search-result { flex-direction: column; align-items: flex-start; }
+  .request-btn { align-self: flex-end; }
 }
