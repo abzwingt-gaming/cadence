@@ -1,5 +1,4 @@
-// api.go
-// HTTP handlers.
+// api.go - HTTP handlers.
 
 package main
 
@@ -101,7 +100,6 @@ func NowPlayingMetadata() http.HandlerFunc {
 	}
 }
 
-// NowPlayingAlbumArt returns base64-encoded album art with in-memory caching.
 func NowPlayingAlbumArt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
@@ -113,7 +111,6 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 		song := results[0]
 		cacheKey := fmt.Sprintf("%d", song.ID)
 
-		// Check in-memory cache first
 		if cached, ok := artCache.Load(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write(cached.([]byte))
@@ -141,14 +138,13 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 		type ArtResponse struct {
 			Picture string `json:"Picture"`
 		}
-		encoded := base64.StdEncoding.EncodeToString(tags.Picture().Data)
-		res := ArtResponse{Picture: encoded}
+		encoded  := base64.StdEncoding.EncodeToString(tags.Picture().Data)
+		res      := ArtResponse{Picture: encoded}
 		jsonBytes, err := json.Marshal(res)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		// Store in cache
 		artCache.Store(cacheKey, jsonBytes)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(jsonBytes)
@@ -197,20 +193,31 @@ func Version() http.HandlerFunc {
 	}
 }
 
-func Ready() http.HandlerFunc {
+// Readyz is the liveness probe: returns 200 as soon as the process is up and DB connected.
+// Docker / Caddy should use this for health routing.
+func Readyz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if dbActive == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		if err := dbActive.Ping(); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
-// Healthz returns DB and Icecast reachability status.
+// Healthz is the readiness probe: returns full status of all dependencies.
+// Use for monitoring dashboards (Uptime Kuma, etc.), not for liveness.
 func Healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbOK := dbActive != nil && dbActive.Ping() == nil
-		n := NowSnapshot()
+		dbOK     := dbActive != nil && dbActive.Ping() == nil
+		n        := NowSnapshot()
 		icecastOK := n.Song.Title != "-" && n.Song.Title != ""
-		status := "ok"
-		code   := http.StatusOK
+		status   := "ok"
+		code     := http.StatusOK
 		if !dbOK || !icecastOK {
 			status = "degraded"
 			code   = http.StatusServiceUnavailable
@@ -218,10 +225,11 @@ func Healthz() http.HandlerFunc {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":   status,
-			"db":       dbOK,
-			"icecast":  icecastOK,
-			"redis":    redisAvailable,
+			"status":  status,
+			"db":      dbOK,
+			"icecast": icecastOK,
+			"redis":   redisAvailable,
+			"version": c.Version,
 		})
 	}
 }

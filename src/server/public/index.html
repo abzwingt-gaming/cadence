@@ -1,24 +1,21 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<!-- data-theme is set by page.js based on localStorage / prefers-color-scheme -->
+<html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cadence Radio</title>
   <meta name="description" content="Self-hosted web radio">
-
   <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
-
   <!-- NES.css -->
   <link href="https://unpkg.com/nes.css@2.3.0/css/nes.min.css" rel="stylesheet">
-  <!-- Google Fonts for NES.css -->
   <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
   <!-- Base styles -->
   <link rel="stylesheet" href="./css/main.css">
-  <!-- User customisation (mounted volume) - loaded last to override everything -->
+  <!-- User customisation (mounted volume) -->
   <link rel="stylesheet" href="./css/custom.css" onerror="this.remove()">
 </head>
 <body>
-
 <main id="app">
   <div id="player" class="nes-container with-title is-centered">
     <p class="title">Now Playing</p>
@@ -38,18 +35,15 @@
       <div id="version">Listeners: <span id="listeners">-</span></div>
     </div>
   </div>
-
   <div id="controls">
-    <button id="themeToggle" class="nes-btn">&#9790; Dark / &#9788; Light</button>
+    <button id="themeToggle" class="nes-btn">&#9790; / &#9788;</button>
   </div>
-
   <div id="tabs">
     <ul class="nes-list">
       <li><button class="nes-btn is-primary tab-btn active" data-tab="request">Request</button></li>
       <li><button class="nes-btn tab-btn" data-tab="history">History</button></li>
     </ul>
   </div>
-
   <div id="tab-content">
     <section data-content="request" class="is-active">
       <div class="nes-field">
@@ -64,14 +58,10 @@
     </section>
   </div>
 </main>
-
 <footer class="nes-container">
   <span>Cadence Radio <span id="release">-</span></span>
-  <span>
-    <a class="nes-text is-primary" target="_blank" href="https://github.com/abzwingt-gaming/cadence">Source</a>
-  </span>
+  <a class="nes-text is-primary" target="_blank" href="https://github.com/abzwingt-gaming/cadence">Source</a>
 </footer>
-
 <script src="./js/aria.js"></script>
 <script src="./js/page.js"></script>
 </body>

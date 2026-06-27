@@ -2,26 +2,7 @@
 
 Self-hosted web radio. Fork of [kenellorando/cadence](https://github.com/kenellorando/cadence), hardened for homelab use.
 
-## What's different from upstream
-
-| Feature | Upstream | This fork |
-|---|---|---|
-| DB | Postgres only | Postgres **or** SQLite (pure Go) |
-| Redis | Required | Optional (graceful skip) |
-| Redis auth | No | Password + DB index |
-| Music scan | Single-threaded | Parallel workers (`CSERVER_SCAN_WORKERS`) |
-| Bad/empty tags | Crash / skip | Filename fallback, always inserts |
-| Audio formats | mp3 flac ogg | + m4a opus wav aac |
-| Icecast URL | One var (public+internal mixed) | Internal status URL + public stream URL separate |
-| Album art | Re-reads disk every request | In-memory cache, cleared on track change |
-| Frontend | jQuery + Bulma | Vanilla JS + NES.css + dark theme |
-| CSS customisation | Rebuild required | Mount `custom.css` volume |
-| Healthcheck | `/ready` only | `/healthz` with DB + Icecast + Redis status |
-| Compose | One profile | Profiles: default / `postgres` / `redis` |
-| Proxy config | nginx example | Caddy example (no snippets) |
-| Install | Interactive shell | Env-driven, sets up profiles |
-| CI | None | Build + lint on push/PR + release on tags |
-| Docker image | Manual build | Published to `ghcr.io` on tag |
+> **This fork does not send PRs upstream.** It is maintained independently.
 
 ## Quick start
 
@@ -35,55 +16,122 @@ Or manually:
 
 ```bash
 cp config/cadence.env.example config/cadence.env
-# Edit config/cadence.env
+# Edit config/cadence.env — set CSERVER_MUSIC_DIR at minimum
 docker compose up -d
 ```
 
-For Postgres + Redis:
+With Postgres + Redis:
+
 ```bash
 docker compose --profile postgres --profile redis up -d
 ```
 
 ## Configuration
 
-All config in `config/cadence.env`. Key variables:
+All config lives in `config/cadence.env`. See `config/cadence.env.example` for every option with comments.
 
-```env
-# DB backend
-CSERVER_DB_BACKEND=sqlite          # or postgres
-CSERVER_SQLITE_PATH=/data/cadence.db
+### Key variables
 
-# Internal Icecast URL (Docker only, never sent to browser)
-CSERVER_ICECAST_STATUS_URL=http://icecast2:8000
+| Variable | Default | Description |
+|---|---|---|
+| `CSERVER_MUSIC_DIR` | *(required)* | Path to music files |
+| `CSERVER_DB_BACKEND` | `sqlite` | `sqlite` or `postgres` |
+| `CSERVER_SQLITE_PATH` | `/data/cadence.db` | SQLite file location |
+| `CSERVER_ICECAST_STATUS_URL` | `http://icecast2:8000` | Internal Icecast URL (Docker only) |
+| `CSERVER_PUBLIC_STREAM_URL` | *(auto)* | Public stream URL sent to browser |
+| `CSERVER_REDISPASSWORD` | *(empty)* | Redis auth password |
+| `CSERVER_REDISDB` | `0` | Redis DB index |
+| `CSERVER_SCAN_WORKERS` | `4` | Parallel tag-read goroutines |
+| `CSERVER_DB_RETRIES` | `5` | DB connect attempts before fatal exit |
+| `CSERVER_DB_RETRY_DELAY_MS` | `3000` | Delay between DB retries |
+| `CSERVER_TITLE_CLEANUP_PATTERNS` | *(built-in)* | Pipe-separated regex to strip from titles |
 
-# Public stream URL sent to browser
-CSERVER_PUBLIC_STREAM_URL=https://radio.example.com/cadence1
+## Endpoints
 
-# Redis (optional)
-CSERVER_REDISPASSWORD=secret
-CSERVER_REDISDB=0
-
-# Scan workers
-CSERVER_SCAN_WORKERS=4
-```
-
-See `config/cadence.env.example` for all options.
+| Path | Purpose |
+|---|---|
+| `/readyz` | **Liveness probe** — DB connected; use for Docker `HEALTHCHECK` |
+| `/healthz` | **Readiness probe** — DB + Icecast + Redis status JSON |
+| `/api/search` | POST search |
+| `/api/request/id` | POST request by ID |
+| `/api/nowplaying/metadata` | GET current track |
+| `/api/nowplaying/albumart` | GET base64 album art |
+| `/api/history` | GET play history |
+| `/api/listenurl` | GET public stream URL |
+| `/api/radiodata/sse` | SSE stream for live track/listener updates |
 
 ## Custom CSS
 
-Edit `src/server/public/css/custom.css` — it is mounted into the container, no rebuild needed.
+Edit `src/server/public/css/custom.css` — mounted into the container as a volume. No rebuild needed.
+
+Example overrides:
+
+```css
+:root { --art-size: 320px; }        /* bigger album art */
+#version { display: none; }          /* hide listener count */
+```
 
 ## Caddy
 
-See `config/Caddyfile.example`.
+See `config/Caddyfile.example` — plain config, no snippets required.
 
 ## Releasing
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-CI builds multi-arch image and pushes to `ghcr.io/abzwingt-gaming/cadence:v1.0.0` + creates a GitHub Release.
+CI automatically:
+1. Builds multi-arch image (`linux/amd64` + `linux/arm64`)
+2. Pushes to `ghcr.io/abzwingt-gaming/cadence:v1.0.0` + `:latest`
+3. Creates GitHub Release with changelog
+
+## Changes vs upstream
+
+### Backend
+
+| Area | Upstream | This fork |
+|---|---|---|
+| DB backends | Postgres only | **Postgres or SQLite** (pure Go, no CGO) |
+| DB init | Drops and recreates DB | `CREATE TABLE IF NOT EXISTS` + upsert — **non-destructive** |
+| DB init failure | Silent warn | **Fatal exit after N retries** with clear error |
+| Redis | Required | **Optional** — graceful skip if unreachable |
+| Redis auth | None | **Password + DB index** (`CSERVER_REDISPASSWORD`, `CSERVER_REDISDB`) |
+| Music scan | Single-threaded | **Parallel goroutine pool** (`CSERVER_SCAN_WORKERS`) |
+| Bad/empty tags | Crash or skip | **Filename fallback**, always inserts |
+| Title cleanup | None | **Auto-strips yt-dlp suffixes** `(Official Video)`, `[HD]`, `- Topic`, etc. |
+| Audio formats | `.mp3 .flac .ogg` | **+ `.m4a .opus .wav .aac`** |
+| Icecast URL | One mixed-use var | **Internal status URL** separate from **public stream URL** |
+| Album art | Re-reads disk every request | **In-memory `sync.Map` cache**, cleared on track change |
+| Version | Env var only | **`ldflags` at build time** from git tag |
+| Liveness probe | `/ready` (200 always) | **`/readyz`** (checks DB) |
+| Readiness probe | None | **`/healthz`** (DB + Icecast + Redis JSON) |
+
+### Frontend
+
+| Area | Upstream | This fork |
+|---|---|---|
+| CSS framework | Bulma | **NES.css** (retro pixel art) |
+| Theme | Light only | **Dark + Light toggle**, persisted in `localStorage` |
+| Theme default | Hardcoded light | **Follows `prefers-color-scheme`** (OS dark mode) |
+| JS dependencies | jQuery | **Vanilla `fetch()` + DOM** — no jQuery |
+| Search | Fire on Enter only | **300ms debounce** on keyup |
+| CSS customisation | Rebuild required | **`custom.css` Docker volume mount** — edit without rebuild |
+| Stream status | `Disconnected` (binary) | `Waiting / Connected` with colour coding |
+| Rate limit message | Generic fail | **`Rate limited. Try again later.`** (HTTP 429) |
+
+### Infrastructure
+
+| Area | Upstream | This fork |
+|---|---|---|
+| Docker Compose | Single profile | **Profiles**: default / `--profile postgres` / `--profile redis` |
+| Proxy config | nginx only | **Caddy** (`config/Caddyfile.example`) |
+| Healthcheck | None in compose | **`wget /readyz`** in image + compose |
+| Install script | Interactive (basic) | **Env-driven, profile-aware**, sets up all options |
+| CI | None | **GitHub Actions**: build + lint on push/PR, release on tag |
+| Docker image | Manual build | **Published to `ghcr.io`** on `v*.*.*` tag, multi-arch |
+| Non-root container | No | **`adduser cadence`**, runs as non-root |
 
 ## Improvements backlog
 

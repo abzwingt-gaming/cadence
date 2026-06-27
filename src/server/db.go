@@ -1,6 +1,4 @@
-// db.go
-// Backend-agnostic DB helpers. All api code uses these functions.
-// Routes calls to postgres or sqlite depending on CSERVER_DB_BACKEND.
+// db.go - backend-agnostic DB helpers + tag extraction with title normalisation.
 
 package main
 
@@ -10,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
@@ -17,16 +16,43 @@ import (
 	"github.com/dhowden/tag"
 )
 
-// dbActive points to whichever *sql.DB is in use.
 var dbActive *sql.DB
 
-// audioExtensions supported for scanning.
 var audioExtensions = map[string]bool{
 	".mp3": true, ".flac": true, ".ogg": true,
 	".m4a": true, ".opus": true, ".wav": true, ".aac": true,
 }
 
-// sanitize returns s trimmed; falls back to fallback if empty.
+// compiled title cleanup patterns, built once at first populate.
+var titleCleanupRe []*regexp.Regexp
+var titleCleanupOnce sync.Once
+
+func buildTitleCleanupRe() {
+	titleCleanupOnce.Do(func() {
+		for _, pat := range strings.Split(c.TitleCleanupPatterns, "|") {
+			pat = strings.TrimSpace(pat)
+			if pat == "" {
+				continue
+			}
+			re, err := regexp.Compile(pat)
+			if err != nil {
+				slog.Warn("Bad title cleanup pattern, skipping.", "pattern", pat, "error", err)
+				continue
+			}
+			titleCleanupRe = append(titleCleanupRe, re)
+		}
+		slog.Info(fmt.Sprintf("Title cleanup: %d patterns loaded.", len(titleCleanupRe)))
+	})
+}
+
+// cleanTitle strips common yt-dlp suffixes and trims the result.
+func cleanTitle(s string) string {
+	for _, re := range titleCleanupRe {
+		s = re.ReplaceAllString(s, "")
+	}
+	return strings.TrimSpace(s)
+}
+
 func sanitize(s, fallback string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -35,13 +61,11 @@ func sanitize(s, fallback string) string {
 	return s
 }
 
-// searchByQuery searches the active DB for songs matching query.
 func searchByQuery(query string) ([]SongData, error) {
 	query = strings.TrimSpace(query)
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByQuery(query)
 	}
-	// Postgres: fuzzystrmatch levenshtein ordering
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE artist ILIKE $1 OR title ILIKE $2
@@ -104,8 +128,9 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 	return results, rows.Err()
 }
 
-// dbPopulate scans MusicDir with parallel workers and upserts metadata.
 func dbPopulate() error {
+	buildTitleCleanupRe()
+
 	if c.MusicDir == "" {
 		slog.Warn("CSERVER_MUSIC_DIR not set, skipping populate.")
 		return nil
@@ -115,11 +140,10 @@ func dbPopulate() error {
 		return err
 	}
 
-	// Collect all audio files first
 	var files []string
 	err := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Warn("Walk error, skipping path.", "path", path, "error", err)
+			slog.Warn("Walk error, skipping.", "path", path, "error", err)
 			return nil
 		}
 		if !info.IsDir() && audioExtensions[strings.ToLower(filepath.Ext(path))] {
@@ -135,7 +159,7 @@ func dbPopulate() error {
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	slog.Info(fmt.Sprintf("Scanning %d audio files with %d workers...", len(files), workers))
+	slog.Info(fmt.Sprintf("Scanning %d files with %d workers...", len(files), workers))
 
 	fileCh := make(chan string, len(files))
 	for _, f := range files {
@@ -163,7 +187,6 @@ func dbPopulate() error {
 				}
 				mu.Lock()
 				if upsertErr != nil {
-					slog.Warn("Upsert failed, skipping.", "path", path, "error", upsertErr)
 					skipped++
 				} else {
 					scanned++
@@ -173,35 +196,33 @@ func dbPopulate() error {
 		}()
 	}
 	wg.Wait()
-	slog.Info(fmt.Sprintf("Scan complete: %d inserted/updated, %d skipped.", scanned, skipped))
+	slog.Info(fmt.Sprintf("Scan done: %d ok, %d skipped.", scanned, skipped))
 	return nil
 }
 
-// extractTags reads metadata from a file.
-// Always returns usable strings even for yt-dlp downloads with missing tags.
+// extractTags reads ID3/Vorbis/MP4 tags. Always returns usable strings.
+// Applies title normalisation to clean yt-dlp-style suffixes.
 func extractTags(path string) (title, album, artist, genre, year string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	title  = base
 	artist = "Unknown Artist"
 	album  = "Unknown Album"
-	genre  = ""
-	year   = ""
 
 	f, err := os.Open(path)
 	if err != nil {
-		slog.Warn("Cannot open file for tag read.", "path", path, "error", err)
+		slog.Warn("Cannot open for tag read.", "path", path)
 		return
 	}
 	defer f.Close()
 
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		// Very common with yt-dlp .opus/.m4a - just use filename
-		slog.Debug("Tag read failed, using filename fallback.", "path", path)
+		slog.Debug("Tag read failed, using filename.", "path", path)
+		title = cleanTitle(base)
 		return
 	}
 
-	title  = sanitize(tags.Title(),  base)
+	title  = cleanTitle(sanitize(tags.Title(),  base))
 	artist = sanitize(tags.Artist(), "Unknown Artist")
 	album  = sanitize(tags.Album(),  "Unknown Album")
 	genre  = sanitize(tags.Genre(),  "")

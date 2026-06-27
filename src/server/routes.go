@@ -23,8 +23,8 @@ func routes() *http.ServeMux {
 	r.Handle("/api/listeners",           Listeners())
 	r.Handle("/api/bitrate",             Bitrate())
 	r.Handle("/api/version",             Version())
-	r.Handle("/healthz",                 Healthz())
-	r.Handle("/ready",                   Ready())
+	r.Handle("/readyz",                  Readyz())  // liveness: DB up
+	r.Handle("/healthz",                 Healthz()) // readiness: DB + Icecast + Redis
 	if c.DevMode {
 		r.Handle("/api/dev/skip", DevSkip())
 	}
