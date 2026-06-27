@@ -37,7 +37,7 @@ type RadioInfo struct {
 	Song       SongData
 	Host       string
 	Mountpoint string
-	Listeners  float64
+	Listeners  int64   // -1 = icecast unreachable / stream idle
 	Bitrate    float64
 }
 
@@ -102,7 +102,10 @@ func liquidsoapTelnet(cmd string) (string, error) {
 		return "", err
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(c.LiquidsoapTimeout))
+	// SetDeadline bounds both write and read; error is non-fatal but logged.
+	if dlErr := conn.SetDeadline(time.Now().Add(c.LiquidsoapTimeout)); dlErr != nil {
+		slog.Warn("Liquidsoap telnet SetDeadline failed.", "error", dlErr)
+	}
 	if _, err = fmt.Fprintf(conn, "%s\n", cmd); err != nil {
 		slog.Error("Liquidsoap telnet write failed.", "cmd", cmd, "error", err)
 		return "", err
@@ -111,7 +114,7 @@ func liquidsoapTelnet(cmd string) (string, error) {
 	if err != nil {
 		slog.Warn("Liquidsoap telnet read partial.", "cmd", cmd, "error", err)
 	}
-	fmt.Fprintf(conn, "quit\n")
+	fmt.Fprintf(conn, "quit\n") //nolint:errcheck // best-effort
 	slog.Debug("Liquidsoap telnet ok.", "cmd", cmd, "resp", strings.TrimSpace(msg))
 	return msg, err
 }
@@ -196,8 +199,38 @@ func filesystemMonitor() {
 	}
 }
 
+// icecastSource extracts per-source fields from the parsed Icecast JSON.
+// Icecast returns "source" as either a single object or an array when
+// multiple mountpoints are active. We always pick the first active source
+// that matches our mountpoint (or simply the first one).
+func icecastSource(j *gabs.Container) *gabs.Container {
+	src := j.Path("icestats.source")
+	if src == nil {
+		return nil
+	}
+	// Array case: multiple mountpoints.
+	if children, err := src.Children(); err == nil && len(children) > 0 {
+		// Prefer the mountpoint that matches our configured public stream,
+		// otherwise fall back to the first child.
+		mount := "/" + c.PostgresTableName // e.g. /cadence1 — not ideal, use a dedicated config field eventually
+		_ = mount
+		for _, child := range children {
+			if listenURL, ok := child.Path("listenurl").Data().(string); ok {
+				if c.PublicStreamURL != "" && strings.Contains(listenURL, c.PublicStreamURL) {
+					return child
+				}
+			}
+		}
+		// No match — return first active source.
+		return children[0]
+	}
+	// Single object case.
+	return src
+}
+
 func icecastMonitor() {
 	var prev RadioInfo
+
 	reset := func() {
 		nowMu.Lock()
 		now.Song.Title = "-"
@@ -237,27 +270,35 @@ func icecastMonitor() {
 			return
 		}
 
-		artistVal := j.Path("icestats.source.artist").Data()
-		titleVal := j.Path("icestats.source.title").Data()
-		if artistVal == nil || titleVal == nil {
+		src := icecastSource(j)
+		if src == nil {
 			slog.Debug("Icecast: no source data (stream idle?).")
 			reset()
 			return
 		}
 
+		artistVal, aOK := src.Path("artist").Data().(string)
+		titleVal, tOK := src.Path("title").Data().(string)
+		if !aOK || !tOK || (artistVal == "" && titleVal == "") {
+			slog.Debug("Icecast: source present but no artist/title (stream idle?).")
+			reset()
+			return
+		}
+
 		nowMu.Lock()
-		now.Song.Artist, _ = artistVal.(string)
-		now.Song.Title, _ = titleVal.(string)
+		now.Song.Artist = artistVal
+		now.Song.Title = titleVal
 		if h, ok := j.Path("icestats.host").Data().(string); ok {
 			now.Host = h
 		}
-		if m, ok := j.Path("icestats.source.server_name").Data().(string); ok {
+		if m, ok := src.Path("server_name").Data().(string); ok {
 			now.Mountpoint = m
 		}
-		if l, ok := j.Path("icestats.source.listeners").Data().(float64); ok {
-			now.Listeners = l
+		// listeners is a JSON number; gabs decodes all numbers as float64.
+		if l, ok := src.Path("listeners").Data().(float64); ok {
+			now.Listeners = int64(l)
 		}
-		if b, ok := j.Path("icestats.source.bitrate").Data().(float64); ok {
+		if b, ok := src.Path("bitrate").Data().(float64); ok {
 			now.Bitrate = b
 		}
 		nowMu.Unlock()
@@ -269,11 +310,10 @@ func icecastMonitor() {
 				"title", nowSnap.Song.Title,
 				"artist", nowSnap.Song.Artist,
 			)
-			// Safe cache clear: delete each key individually (no data race).
 			artCacheClear()
 			if redisAvailable.Load() {
-				if err := dbr.RateLimitArt.FlushDB(ctx).Err(); err != nil {
-					slog.Warn("Redis FlushDB for art rate limit failed.", "error", err)
+				if flushErr := dbr.RateLimitArt.FlushDB(ctx).Err(); flushErr != nil {
+					slog.Warn("Redis FlushDB for art rate limit failed.", "error", flushErr)
 				}
 			}
 			radiodata_sse.SendEventMessage(nowSnap.Song.Title, "title", "")
@@ -312,8 +352,11 @@ func icecastMonitor() {
 	}
 
 	slog.Info("Icecast monitor started.", "url", c.IcecastStatusURL, "poll", c.IcecastPollInterval)
-	for {
-		time.Sleep(c.IcecastPollInterval)
+	// Use a Ticker so poll interval is wall-clock accurate regardless of
+	// how long check() takes. time.Sleep would drift when Icecast is slow.
+	ticker := time.NewTicker(c.IcecastPollInterval)
+	defer ticker.Stop()
+	for range ticker.C {
 		check()
 	}
 }

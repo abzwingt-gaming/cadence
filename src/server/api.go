@@ -128,7 +128,7 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 			return
 		}
 
-		// 1. Try embedded tags — scoped in closure so defer fires immediately.
+		// 1. Try embedded tags — scoped in a closure so defer fires immediately.
 		var encoded string
 		func() {
 			f, ferr := os.Open(path)
@@ -142,7 +142,7 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 			}
 		}()
 
-		// 2. Fallback: cover.jpg / folder.jpg in same directory.
+		// 2. Fallback: cover.jpg / folder.jpg in the same directory.
 		if encoded == "" {
 			if fallbackPath := ArtworkPath(path); fallbackPath != "" {
 				if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
@@ -197,8 +197,13 @@ func ListenURL() http.HandlerFunc {
 func Listeners() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
+		listeners := n.Listeners
+		// -1 means icecast is unreachable / stream idle; report 0 to the client.
+		if listeners < 0 {
+			listeners = 0
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ Listeners int }{Listeners: int(n.Listeners)})
+		json.NewEncoder(w).Encode(struct{ Listeners int64 }{Listeners: listeners})
 	}
 }
 
@@ -206,7 +211,7 @@ func Bitrate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ Bitrate int }{Bitrate: int(n.Bitrate)})
+		json.NewEncoder(w).Encode(struct{ Bitrate float64 }{Bitrate: n.Bitrate})
 	}
 }
 
