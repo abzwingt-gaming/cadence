@@ -1,5 +1,6 @@
 // db_redis.go
-// Rate limit database functions.
+// Rate limiting via Redis. Redis is optional.
+// If unavailable, rate limiting is skipped gracefully.
 
 package main
 
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -18,57 +20,56 @@ var ctx = context.Background()
 var dbr = RedisClient{}
 var redisAvailable = false
 
+// redisAvailable is written once in redisInit and read concurrently from
+// HTTP handlers — must be atomic to avoid a data race.
+var redisAvailable atomic.Bool
+
 type RedisClient struct {
 	RateLimitRequest *redis.Client
 	RateLimitArt     *redis.Client
 }
 
 func redisInit() {
-	addr := c.RedisAddress + c.RedisPort
-	client := redis.NewClient(&redis.Options{
-		Addr:     addr,
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     c.RedisAddress + c.RedisPort,
 		Password: c.RedisPassword,
-		DB:       c.RedisDBRequest,
+		DB:       c.RedisDB,
 	})
-	_, err := client.Ping(ctx).Result()
-	if err != nil {
-		slog.Warn("Redis is unavailable. Rate limiting disabled. Consider using Caddy rate_limit module.",
-			"func", "redisInit", "addr", addr, "error", err)
+	if _, err := rdb.Ping(ctx).Result(); err != nil {
+		slog.Warn("Redis unavailable. Rate limiting disabled.", "error", err)
 		return
 	}
-	dbr.RateLimitRequest = client
+	dbr.RateLimitRequest = rdb
 	dbr.RateLimitArt = redis.NewClient(&redis.Options{
-		Addr:     addr,
+		Addr:     c.RedisAddress + c.RedisPort,
 		Password: c.RedisPassword,
-		DB:       c.RedisDBArt,
+		DB:       c.RedisDB + 1, // art uses next DB index
 	})
-	redisAvailable = true
-	slog.Info("Redis connected.", "func", "redisInit", "addr", addr)
+	redisAvailable.Store(true)
+	slog.Info("Redis connected.", "addr", c.RedisAddress+c.RedisPort, "db", c.RedisDB)
 }
 
 func rateLimitRequest(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable {
+		if !redisAvailable.Load() {
 			next.ServeHTTP(w, r)
 			return
 		}
 		ip, err := checkIP(r)
 		if err != nil {
-			slog.Error("Couldn't start IP address check for request API.", "func", "rateLimitRequest", "error", err)
+			slog.Error("checkIP failed.", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		_, err = dbr.RateLimitRequest.Get(ctx, ip).Result()
-		if err != nil {
-			if err == redis.Nil {
-				dbr.RateLimitRequest.Set(ctx, ip, nil, time.Duration(c.RequestRateLimit)*time.Second)
-				next.ServeHTTP(w, r)
-			} else {
-				slog.Error("Redis error while checking IP.", "func", "rateLimitRequest", "error", err)
-				next.ServeHTTP(w, r) // degrade gracefully
-			}
+		if err == redis.Nil {
+			dbr.RateLimitRequest.Set(ctx, ip, 1, time.Duration(c.RequestRateLimit)*time.Second)
+			next.ServeHTTP(w, r)
+		} else if err != nil {
+			slog.Warn("Redis error in rateLimitRequest, passing through.", "error", err)
+			next.ServeHTTP(w, r)
 		} else {
-			slog.Info(fmt.Sprintf("IP <%s> is rate limited.", ip), "func", "rateLimitRequest")
+			slog.Info(fmt.Sprintf("Rate limited: %s", ip))
 			w.WriteHeader(http.StatusTooManyRequests)
 		}
 	})
@@ -76,55 +77,45 @@ func rateLimitRequest(next http.Handler) http.Handler {
 
 func rateLimitArt(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable {
+		if !redisAvailable.Load() {
 			next.ServeHTTP(w, r)
 			return
 		}
 		ip, err := checkIP(r)
 		if err != nil {
-			slog.Error("Couldn't start IP address check for artwork API.", "func", "rateLimitArt", "error", err)
+			slog.Error("checkIP failed.", "error", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		_, err = dbr.RateLimitArt.Get(ctx, ip).Result()
-		if err != nil {
-			if err == redis.Nil {
-				dbr.RateLimitArt.Set(ctx, ip, 1, time.Duration(200)*time.Second)
-				next.ServeHTTP(w, r)
-			} else {
-				slog.Error("Redis error while checking IP.", "func", "rateLimitArt", "error", err)
-				next.ServeHTTP(w, r) // degrade gracefully
-			}
+		if err == redis.Nil {
+			dbr.RateLimitArt.Set(ctx, ip, 1, 200*time.Second)
+			next.ServeHTTP(w, r)
+		} else if err != nil {
+			slog.Warn("Redis error in rateLimitArt, passing through.", "error", err)
+			next.ServeHTTP(w, r)
 		} else {
-			count, err := dbr.RateLimitArt.Get(ctx, ip).Int()
-			if err != nil {
-				slog.Error("Couldn't get artwork request count.", "func", "rateLimitArt", "error", err)
-				next.ServeHTTP(w, r)
-				return
-			}
+			count, _ := dbr.RateLimitArt.Get(ctx, ip).Int()
 			if count >= 16 {
-				slog.Info(fmt.Sprintf("IP <%s> is art rate limited.", ip), "func", "rateLimitArt")
 				w.WriteHeader(http.StatusNotModified)
 				return
 			}
-			dbr.RateLimitArt.Set(ctx, ip, count+1, time.Duration(200)*time.Second)
+			dbr.RateLimitArt.Set(ctx, ip, count+1, 200*time.Second)
 			next.ServeHTTP(w, r)
 		}
 	})
 }
 
-func checkIP(r *http.Request) (ip string, err error) {
-	if r.RemoteAddr != "" {
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			slog.Error("Couldn't split client address.", "func", "checkIP", "error", err)
-			return "", err
-		}
-		if ip == "" {
-			slog.Warn("Client IP was blank.", "func", "checkIP")
-			return "", err
-		}
-		return ip, nil
+func checkIP(r *http.Request) (string, error) {
+	if r.RemoteAddr == "" {
+		return "", fmt.Errorf("empty RemoteAddr")
 	}
-	return "", err
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return "", err
+	}
+	if ip == "" {
+		return "", fmt.Errorf("blank IP")
+	}
+	return ip, nil
 }
