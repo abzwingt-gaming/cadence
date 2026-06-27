@@ -1,6 +1,6 @@
 // db.go
-// Backend-agnostic DB helpers. Routes calls to postgres or sqlite depending on
-// CSERVER_DB_BACKEND. All api_actions.go and api.go code uses these.
+// Backend-agnostic DB helpers. All api code uses these functions.
+// Routes calls to postgres or sqlite depending on CSERVER_DB_BACKEND.
 
 package main
 
@@ -17,16 +17,16 @@ import (
 	"github.com/dhowden/tag"
 )
 
-// dbActive points to whichever *sql.DB is in use
+// dbActive points to whichever *sql.DB is in use.
 var dbActive *sql.DB
 
-// audioExtensions supported for scanning
+// audioExtensions supported for scanning.
 var audioExtensions = map[string]bool{
 	".mp3": true, ".flac": true, ".ogg": true,
 	".m4a": true, ".opus": true, ".wav": true, ".aac": true,
 }
 
-// sanitize returns a non-empty string; falls back to `fallback`.
+// sanitize returns s trimmed; falls back to fallback if empty.
 func sanitize(s, fallback string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -41,7 +41,7 @@ func searchByQuery(query string) ([]SongData, error) {
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByQuery(query)
 	}
-	// Postgres path with fuzzystrmatch levenshtein
+	// Postgres: fuzzystrmatch levenshtein ordering
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE artist ILIKE $1 OR title ILIKE $2
@@ -110,18 +110,17 @@ func dbPopulate() error {
 		slog.Warn("CSERVER_MUSIC_DIR not set, skipping populate.")
 		return nil
 	}
-	_, err := os.Stat(c.MusicDir)
-	if err != nil {
-		slog.Error("Music directory not found.", "dir", c.MusicDir, "error", err)
+	if _, err := os.Stat(c.MusicDir); err != nil {
+		slog.Error("Music directory not accessible.", "dir", c.MusicDir, "error", err)
 		return err
 	}
 
-	// Collect files first
+	// Collect all audio files first
 	var files []string
-	err = filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Warn("Walk error.", "path", path, "error", err)
-			return nil // don't abort walk on single file error
+			slog.Warn("Walk error, skipping path.", "path", path, "error", err)
+			return nil
 		}
 		if !info.IsDir() && audioExtensions[strings.ToLower(filepath.Ext(path))] {
 			files = append(files, path)
@@ -178,11 +177,11 @@ func dbPopulate() error {
 	return nil
 }
 
-// extractTags reads ID3/Vorbis/MP4 tags from a file.
-// Always returns usable strings even for yt-dlp downloads with minimal tags.
+// extractTags reads metadata from a file.
+// Always returns usable strings even for yt-dlp downloads with missing tags.
 func extractTags(path string) (title, album, artist, genre, year string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	title  = base // fallback: filename without extension
+	title  = base
 	artist = "Unknown Artist"
 	album  = "Unknown Album"
 	genre  = ""
@@ -197,8 +196,8 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		// Common with yt-dlp opus/webm files - just use filename
-		slog.Debug("Tag read failed, using filename fallback.", "path", path, "error", err)
+		// Very common with yt-dlp .opus/.m4a - just use filename
+		slog.Debug("Tag read failed, using filename fallback.", "path", path)
 		return
 	}
 
