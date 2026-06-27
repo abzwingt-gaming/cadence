@@ -10,6 +10,7 @@ const API = {
   sse:      '/api/radiodata/sse',
   version:  '/api/version',
   bitrate:  '/api/bitrate',
+  listeners:'/api/listeners',
 };
 
 let streamSrcURL = '';
@@ -57,13 +58,14 @@ function scheduleInfoUpdate() {
 
 function updateInfo() {
   Promise.all([
-    fetch('/api/listeners').then(r => r.json()),
+    fetch(API.listeners).then(r => r.json()),
     fetch(API.bitrate).then(r => r.json()),
   ]).then(([l, b]) => {
     const listeners = (l.Listeners >= 0) ? l.Listeners : '?';
     const bitrate   = (b.Bitrate   >  0) ? b.Bitrate + ' kbps' : '';
-    document.getElementById('version').textContent =
-      'Listeners: ' + listeners + (bitrate ? '  ·  ' + bitrate : '');
+    // Update the #listeners element (renamed from #version in a previous fix).
+    document.getElementById('listeners').textContent =
+      'Listeners: ' + listeners + (bitrate ? '  \xb7  ' + bitrate : '');
   }).catch(() => {});
 }
 
@@ -91,15 +93,22 @@ function fetchArt() {
   });
 }
 
-// --- Search (300ms debounce) ---
+// --- Search (300ms debounce, 2-char minimum) ---
+const SEARCH_MIN_LEN = 2;
 let searchTimer;
 document.getElementById('searchInput').addEventListener('keyup', e => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => doSearch(e.target.value.trim()), 300);
+  const q = e.target.value.trim();
+  // Clear results immediately when input is too short.
+  if (q.length < SEARCH_MIN_LEN) {
+    document.getElementById('searchResults').innerHTML = '';
+    return;
+  }
+  searchTimer = setTimeout(() => doSearch(q), 300);
 });
 
 function doSearch(q) {
-  if (!q) {
+  if (!q || q.length < SEARCH_MIN_LEN) {
     document.getElementById('searchResults').innerHTML = '';
     return;
   }
@@ -124,7 +133,7 @@ function doSearch(q) {
       title.className = 'song-title';
       title.textContent = s.Title;
 
-      const sep = document.createTextNode(' — ');
+      const sep = document.createTextNode(' \u2014 ');
 
       const artist = document.createElement('span');
       artist.className = 'song-artist nes-text is-primary';
@@ -175,6 +184,21 @@ function requestSong(id) {
 }
 
 // --- History ---
+function formatEnded(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    // Relative time if within 24 h, otherwise locale date.
+    const diffMs = Date.now() - d.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1)  return 'just now';
+    if (diffMin < 60) return diffMin + 'm ago';
+    const diffH = Math.floor(diffMin / 60);
+    if (diffH < 24)   return diffH + 'h ago';
+    return d.toLocaleDateString();
+  } catch (_) { return ''; }
+}
+
 function loadHistory() {
   fetch(API.history).then(r => r.json()).then(items => {
     const el = document.getElementById('historyResults');
@@ -192,7 +216,7 @@ function loadHistory() {
       title.className = 'song-title';
       title.textContent = h.Title;
 
-      const sep = document.createTextNode(' — ');
+      const sep = document.createTextNode(' \u2014 ');
 
       const artist = document.createElement('span');
       artist.className = 'song-artist nes-text is-primary';
@@ -201,11 +225,47 @@ function loadHistory() {
       div.appendChild(title);
       div.appendChild(sep);
       div.appendChild(artist);
+
+      // Timestamp: show when the track ended.
+      const ended = formatEnded(h.Ended);
+      if (ended) {
+        const ts = document.createElement('span');
+        ts.className = 'history-ts';
+        ts.textContent = ' (' + ended + ')';
+        ts.style.cssText = 'opacity:0.55;font-size:0.8em;margin-left:0.4em';
+        div.appendChild(ts);
+      }
+
       el.appendChild(div);
     });
   }).catch(() => {});
 }
 loadHistory();
+
+// --- Volume persistence ---
+// Restore saved volume on load; save on change.
+(function initVolume() {
+  const volEl = document.getElementById('volume');
+  if (!volEl) return;
+  try {
+    const saved = localStorage.getItem('cadence_volume');
+    if (saved !== null) volEl.value = saved;
+  } catch (_) {}
+  volEl.addEventListener('input', () => {
+    try { localStorage.setItem('cadence_volume', volEl.value); } catch (_) {}
+  });
+})();
+
+// --- Keyboard shortcut: Space bar → play/pause ---
+// Only fires when focus is NOT inside the search input.
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  const tag = (document.activeElement || {}).tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON') return;
+  e.preventDefault();
+  const btn = document.getElementById('playButton');
+  if (btn) btn.click();
+});
 
 // Initial info load
 updateInfo();

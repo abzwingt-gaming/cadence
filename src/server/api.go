@@ -27,12 +27,21 @@ func streamIdle(title, artist string) bool {
 
 // buildPublicStream constructs the public stream URL from host+mountpoint,
 // trimming slashes to prevent double-slash when host ends with "/" or
-// mountpoint starts with "/".
+// mountpoint starts with "/". Used by both ListenURL() and icecastMonitor().
 func buildPublicStream(host, mountpoint string) string {
 	if c.PublicStreamURL != "" {
 		return c.PublicStreamURL
 	}
 	return strings.TrimRight(host, "/") + "/" + strings.TrimLeft(mountpoint, "/")
+}
+
+// writeJSON encodes v as JSON into w, setting Content-Type and logging any
+// encode error. Callers must not write a status code before calling writeJSON.
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Warn("JSON encode error.", "error", err)
+	}
 }
 
 func Search() http.HandlerFunc {
@@ -53,8 +62,7 @@ func Search() http.HandlerFunc {
 		if results == nil {
 			results = []SongData{}
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(results)
+		writeJSON(w, results)
 	}
 }
 
@@ -125,8 +133,7 @@ func NowPlayingMetadata() http.HandlerFunc {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(results[0])
+		writeJSON(w, results[0])
 	}
 }
 
@@ -211,8 +218,7 @@ func History() http.HandlerFunc {
 		if snap == nil {
 			snap = []playRecord{}
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(snap)
+		writeJSON(w, snap)
 	}
 }
 
@@ -222,8 +228,7 @@ func ListenURL() http.HandlerFunc {
 		// buildPublicStream trims slashes to prevent double-slash when
 		// Icecast host ends with "/" or mountpoint starts with "/".
 		publicURL := buildPublicStream(n.Host, n.Mountpoint)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ ListenURL string }{ListenURL: publicURL})
+		writeJSON(w, struct{ ListenURL string }{ListenURL: publicURL})
 	}
 }
 
@@ -235,23 +240,20 @@ func Listeners() http.HandlerFunc {
 		if listeners < 0 {
 			listeners = 0
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ Listeners int64 }{Listeners: listeners})
+		writeJSON(w, struct{ Listeners int64 }{Listeners: listeners})
 	}
 }
 
 func Bitrate() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ Bitrate float64 }{Bitrate: n.Bitrate})
+		writeJSON(w, struct{ Bitrate float64 }{Bitrate: n.Bitrate})
 	}
 }
 
 func Version() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(struct{ Version string }{Version: c.Version})
+		writeJSON(w, struct{ Version string }{Version: c.Version})
 	}
 }
 
@@ -303,13 +305,15 @@ func Healthz() http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(code)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":  status,
 			"db":      dbOK,
 			"icecast": icecastOK,
 			"redis":   redisAvailable.Load(),
 			"version": c.Version,
-		})
+		}); err != nil {
+			slog.Warn("Healthz JSON encode error.", "error", err)
+		}
 	}
 }
 

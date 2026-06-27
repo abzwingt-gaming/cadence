@@ -335,14 +335,10 @@ func icecastMonitor() {
 			}
 		}
 
-		// Build the public stream URL cleanly to avoid double-slash when
-		// Host already ends with "/" or Mountpoint already starts with "/".
-		publicStream := c.PublicStreamURL
-		if publicStream == "" {
-			host := strings.TrimRight(nowSnap.Host, "/")
-			mount := strings.TrimLeft(nowSnap.Mountpoint, "/")
-			publicStream = host + "/" + mount
-		}
+		// Use the shared buildPublicStream helper (defined in api.go) to build
+		// the public stream URL. This avoids duplicating the double-slash trim
+		// logic that previously existed inline here.
+		publicStream := buildPublicStream(nowSnap.Host, nowSnap.Mountpoint)
 		if prev.Host != nowSnap.Host || prev.Mountpoint != nowSnap.Mountpoint {
 			radiodata_sse.SendEventMessage(publicStream, "listenurl", "")
 			slog.Debug("Stream URL updated.", "url", publicStream)
