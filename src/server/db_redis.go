@@ -40,12 +40,22 @@ func redisAddr() string {
 }
 
 func redisInit() {
+	// Redis supports DB indices 0–15. Clamp so DB+1 for art never overflows.
+	const redisMaxDB = 15
+	db := c.RedisDB
+	if db < 0 || db > redisMaxDB-1 {
+		slog.Warn("CSERVER_REDISDB out of range, clamping.",
+			"requested", db, "clamped", 0)
+		db = 0
+	}
+	dbArt := db + 1 // dedicated DB so FlushDB on track-change is safe
+
 	addr := redisAddr()
-	slog.Info("Connecting to Redis.", "addr", addr, "db", c.RedisDB)
+	slog.Info("Connecting to Redis.", "addr", addr, "db", db, "db_art", dbArt)
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: c.RedisPassword,
-		DB:       c.RedisDB,
+		DB:       db,
 	})
 	if _, err := rdb.Ping(ctx).Result(); err != nil {
 		slog.Warn("Redis unavailable — rate limiting disabled.", "addr", addr, "error", err)
@@ -55,7 +65,7 @@ func redisInit() {
 	dbr.RateLimitArt = redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: c.RedisPassword,
-		DB:       c.RedisDB + 1, // dedicated DB so FlushDB is safe
+		DB:       dbArt,
 	})
 	redisAvailable.Store(true)
 	slog.Info("Redis connected — rate limiting enabled.",

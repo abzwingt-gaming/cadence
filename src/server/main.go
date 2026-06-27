@@ -59,10 +59,10 @@ type ServerConfig struct {
 	PatternSeparator      string
 	// RealIPHeader: header set by Caddy/nginx with the real client IP.
 	// e.g. "X-Forwarded-For" or "X-Real-IP". Empty = use RemoteAddr.
-	RealIPHeader  string
+	RealIPHeader string
 	// TrustedProxy: CIDR or IP of the upstream proxy. Only read RealIPHeader
 	// when RemoteAddr matches this. Empty = trust all (only safe on LAN).
-	TrustedProxy  string
+	TrustedProxy string
 }
 
 func parseLogLevel(level string) slog.Level {
@@ -98,6 +98,13 @@ func stripScheme(addr string) string {
 // stripColon strips a leading colon from a port string (":8080" → "8080").
 func stripColon(port string) string {
 	return strings.TrimPrefix(port, ":")
+}
+
+// normalizePort ensures the port has a leading colon for http.ListenAndServe.
+// Accepts both "8080" and ":8080".
+func normalizePort(port string) string {
+	p := strings.TrimPrefix(port, ":")
+	return ":" + p
 }
 
 func envOrDefault(key, def string) string {
@@ -139,48 +146,49 @@ func loadConfig() {
 	} else {
 		c.Version = envOrDefault("CSERVER_VERSION", "dev")
 	}
-	c.RootPath             = envOrDefault("CSERVER_ROOTPATH", "/app/public/")
-	c.Port                 = envOrDefault("CSERVER_PORT", ":8080")
-	c.MusicDir             = os.Getenv("CSERVER_MUSIC_DIR")
-	c.LiquidsoapAddress    = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
-	// Ports are stored WITHOUT colon. stripColon handles user input with or without.
-	c.LiquidsoapPort       = stripColon(envOrDefault("CSERVER_LIQUIDSOAPPORT", "1234"))
-	c.LiquidsoapHTTPPort   = stripColon(envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", "8001"))
-	c.LiquidsoapMode       = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
-	c.LiquidsoapTimeout    = envDuration("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5*time.Second)
-	c.IcecastStatusURL     = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
-	c.IcecastPollInterval  = envDuration("CSERVER_ICECAST_POLL_INTERVAL_MS", time.Second)
-	c.PublicStreamURL      = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
-	c.DBBackend            = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "sqlite"))
-	c.DBRetries            = envInt("CSERVER_DB_RETRIES", 5)
-	c.DBRetryDelay         = envDuration("CSERVER_DB_RETRY_DELAY_MS", 3*time.Second)
-	c.PostgresAddress      = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "cadence-postgres"))
-	c.PostgresPort         = stripColon(envOrDefault("CSERVER_POSTGRESPORT", "5432"))
-	c.PostgresUser         = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
-	c.PostgresPassword     = os.Getenv("POSTGRES_PASSWORD")
-	c.PostgresDBName       = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
-	c.PostgresTableName    = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
-	c.PostgresSSL          = envOrDefault("CSERVER_POSTGRESSSL", "disable")
-	c.SQLitePath           = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
-	c.RedisAddress         = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "cadence-redis"))
-	c.RedisPort            = stripColon(envOrDefault("CSERVER_REDISPORT", "6379"))
-	c.RedisPassword        = os.Getenv("CSERVER_REDISPASSWORD")
-	c.RedisDB              = envInt("CSERVER_REDISDB", 0)
-	c.RequestRateLimit     = envInt("CSERVER_REQRATELIMIT", 5)
-	c.ArtRateLimitWindow   = envDuration("CSERVER_ART_RATELIMIT_WINDOW_MS", 200*time.Second)
-	c.ArtRateLimitMax      = envInt("CSERVER_ART_RATELIMIT_MAX", 16)
-	c.WhitelistPath        = os.Getenv("CSERVER_WHITELIST_PATH")
-	c.DevMode, _           = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
-	c.LogLevel             = envOrDefault("CSERVER_LOGLEVEL", "info")
-	c.ScanWorkers          = envInt("CSERVER_SCAN_WORKERS", 4)
-	c.HistorySize          = envInt("CSERVER_HISTORY_SIZE", 10)
-	c.FsnotifyDebounce     = envDuration("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3*time.Second)
-	c.PatternSeparator     = envOrDefault("CSERVER_PATTERN_SEPARATOR", ";;")
+	c.RootPath            = envOrDefault("CSERVER_ROOTPATH", "/app/public/")
+	// normalizePort ensures a leading colon regardless of user input format.
+	c.Port                = normalizePort(envOrDefault("CSERVER_PORT", "8080"))
+	c.MusicDir            = os.Getenv("CSERVER_MUSIC_DIR")
+	c.LiquidsoapAddress   = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
+	// Ports stored WITHOUT colon; stripColon handles user input with or without.
+	c.LiquidsoapPort      = stripColon(envOrDefault("CSERVER_LIQUIDSOAPPORT", "1234"))
+	c.LiquidsoapHTTPPort  = stripColon(envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", "8001"))
+	c.LiquidsoapMode      = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
+	c.LiquidsoapTimeout   = envDuration("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5*time.Second)
+	c.IcecastStatusURL    = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
+	c.IcecastPollInterval = envDuration("CSERVER_ICECAST_POLL_INTERVAL_MS", time.Second)
+	c.PublicStreamURL     = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
+	c.DBBackend           = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "sqlite"))
+	c.DBRetries           = envInt("CSERVER_DB_RETRIES", 5)
+	c.DBRetryDelay        = envDuration("CSERVER_DB_RETRY_DELAY_MS", 3*time.Second)
+	c.PostgresAddress     = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "cadence-postgres"))
+	c.PostgresPort        = stripColon(envOrDefault("CSERVER_POSTGRESPORT", "5432"))
+	c.PostgresUser        = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
+	c.PostgresPassword    = os.Getenv("POSTGRES_PASSWORD")
+	c.PostgresDBName      = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
+	c.PostgresTableName   = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
+	c.PostgresSSL         = envOrDefault("CSERVER_POSTGRESSSL", "disable")
+	c.SQLitePath          = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
+	c.RedisAddress        = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "cadence-redis"))
+	c.RedisPort           = stripColon(envOrDefault("CSERVER_REDISPORT", "6379"))
+	c.RedisPassword       = os.Getenv("CSERVER_REDISPASSWORD")
+	c.RedisDB             = envInt("CSERVER_REDISDB", 0)
+	c.RequestRateLimit    = envInt("CSERVER_REQRATELIMIT", 5)
+	c.ArtRateLimitWindow  = envDuration("CSERVER_ART_RATELIMIT_WINDOW_MS", 200*time.Second)
+	c.ArtRateLimitMax     = envInt("CSERVER_ART_RATELIMIT_MAX", 16)
+	c.WhitelistPath       = os.Getenv("CSERVER_WHITELIST_PATH")
+	c.DevMode, _          = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
+	c.LogLevel            = envOrDefault("CSERVER_LOGLEVEL", "info")
+	c.ScanWorkers         = envInt("CSERVER_SCAN_WORKERS", 4)
+	c.HistorySize         = envInt("CSERVER_HISTORY_SIZE", 10)
+	c.FsnotifyDebounce    = envDuration("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3*time.Second)
+	c.PatternSeparator    = envOrDefault("CSERVER_PATTERN_SEPARATOR", ";;")
 	// Behind Caddy: set CSERVER_REAL_IP_HEADER=X-Forwarded-For
 	// Behind nginx:  set CSERVER_REAL_IP_HEADER=X-Real-IP
 	// Direct (no proxy): leave empty
-	c.RealIPHeader         = os.Getenv("CSERVER_REAL_IP_HEADER")
-	c.TrustedProxy         = os.Getenv("CSERVER_TRUSTED_PROXY")
+	c.RealIPHeader        = os.Getenv("CSERVER_REAL_IP_HEADER")
+	c.TrustedProxy        = os.Getenv("CSERVER_TRUSTED_PROXY")
 	c.TitleCleanupPatterns = envOrDefault("CSERVER_TITLE_CLEANUP_PATTERNS",
 		`\s*[\(\[][^\)\]]*[Oo]fficial[^\)\]]*[\)\]]`+`;;`+
 		`\s*[\(\[][^\)\]]*[Ll]yrics?[^\)\]]*[\)\]]`+`;;`+
@@ -248,6 +256,8 @@ func sighupHandler() {
 }
 
 // loggingMiddleware logs every request at DEBUG level.
+// statusWriter proxies http.Flusher so SSE (eventsource) keeps working
+// through the middleware chain.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -271,6 +281,14 @@ type statusWriter struct {
 func (sw *statusWriter) WriteHeader(code int) {
 	sw.status = code
 	sw.ResponseWriter.WriteHeader(code)
+}
+
+// Flush implements http.Flusher so that SSE (eventsource) can flush
+// chunks through the logging middleware without panicking.
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func main() {

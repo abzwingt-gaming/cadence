@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"net/url"
 
 	_ "github.com/lib/pq"
 )
@@ -14,12 +15,19 @@ import (
 var dbp *sql.DB
 
 func postgresInit() error {
-	dsn := fmt.Sprintf(
-		"host='%s' port='%s' user='%s' password='%s' dbname='%s' sslmode='%s'",
-		c.PostgresAddress, c.PostgresPort,
-		c.PostgresUser, c.PostgresPassword,
-		c.PostgresDBName, c.PostgresSSL,
-	)
+	// Use URL-encoded DSN to safely handle passwords containing special
+	// characters (quotes, spaces, @, etc.) that would break key=value syntax.
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(c.PostgresUser, c.PostgresPassword),
+		Host:   fmt.Sprintf("%s:%s", c.PostgresAddress, c.PostgresPort),
+		Path:   "/" + c.PostgresDBName,
+	}
+	q := u.Query()
+	q.Set("sslmode", c.PostgresSSL)
+	u.RawQuery = q.Encode()
+	dsn := u.String()
+
 	var err error
 	dbp, err = sql.Open("postgres", dsn)
 	if err != nil {
