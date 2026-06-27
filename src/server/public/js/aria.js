@@ -1,244 +1,206 @@
-var streamSrcURL = "";
+// aria.js - API communication layer. No jQuery.
 
-$(document).ready(function() {
-	getListenURL()
-	getHistory()
-	getNowPlayingMetadata()
-	getNowPlayingAlbumArt()
-	getVersion()
-	connectRadioData()
-	postSearch()
-	postRequestID()
+let streamSrcURL = '';
+
+document.addEventListener('DOMContentLoaded', () => {
+  fetchVersion();
+  fetchListenURL();
+  fetchHistory();
+  fetchNowPlayingMetadata();
+  fetchNowPlayingAlbumArt();
+  connectSSE();
+  bindSearch();
+  bindRequestButtons();
 });
 
-function getVersion() {
-	$.ajax({
-		type: "GET",
-		url: "/api/version",
-		dataType: "json",
-		success: function (data) {
-			document.getElementById("release").innerHTML = data.Version;
-		},
-		error: function () {
-			document.getElementById("release").innerHTML = "(N/A)";
-		},
-	});
+function apiFetch(url, opts = {}) {
+  return fetch(url, opts).then(r => {
+    if (!r.ok) throw new Error(r.status);
+    if (r.status === 204) return null;
+    return r.json();
+  });
 }
 
-function getNowPlayingMetadata() {
-	$.ajax({
-		type: "GET",
-		url: "/api/nowplaying/metadata",
-		dataType: "json",
-		success: function (data) {
-			$("#song").text(data.Title);
-			$("#artist").text(data.Artist);
-		},
-		error: function () {
-			$("#song").text("-");
-			$("#artist").text("-");
-		},
-	});
+function fetchVersion() {
+  apiFetch('/api/version')
+    .then(d => { document.getElementById('release').textContent = d.Version; })
+    .catch(() => { document.getElementById('release').textContent = '(N/A)'; });
 }
 
-function getNowPlayingAlbumArt() {
-	$.ajax({
-		type: "GET",
-		url: "/api/nowplaying/albumart",
-		dataType: "json",
-		success: function (data) {
-			if (data == undefined) {
-				$("#artwork").attr("src", "./static/blank.jpg");
-			} else {
-				$("#artwork").attr("src", "data:image/jpeg;base64," + data.Picture);
-			}
-		},
-		error: function () {
-			$("#artwork").attr("src", "./static/blank.jpg");
-		},
-	});
+function fetchNowPlayingMetadata() {
+  apiFetch('/api/nowplaying/metadata')
+    .then(d => {
+      document.getElementById('song').textContent   = d ? d.Title  : '-';
+      document.getElementById('artist').textContent = d ? d.Artist : '-';
+    })
+    .catch(() => {
+      document.getElementById('song').textContent   = '-';
+      document.getElementById('artist').textContent = '-';
+    });
 }
 
-function getListenURL() {
-	$.ajax({
-		type: "GET",
-		url: "/api/listenurl",
-		dataType: "json",
-		success: function (data) {
-			if (data.ListenURL == "-/-") {
-				$("#status").html("Disconnected from server.");
-			} else {
-				streamSrcURL = location.protocol + "//" + data.ListenURL;
-				document.getElementById("stream").src = streamSrcURL;
-				$("#status").html(
-					"Connected: <a href='" +
-						streamSrcURL +
-						"'>" +
-						streamSrcURL +
-						"</a>"
-				);
-			}
-		},
-		error: function () {
-			document.getElementById("stream").src = "";
-			$("#status").html("Disconnected from server.");
-		},
-	});
+function fetchNowPlayingAlbumArt() {
+  apiFetch('/api/nowplaying/albumart')
+    .then(d => {
+      const img = document.getElementById('artwork');
+      img.src = (d && d.Picture)
+        ? 'data:image/jpeg;base64,' + d.Picture
+        : './static/blank.jpg';
+    })
+    .catch(() => {
+      document.getElementById('artwork').src = './static/blank.jpg';
+    });
 }
 
-function getHistory() {
-	$.ajax({
-		type: 'GET',
-		url: "/api/history",
-		dataType: "json",
-		success: function(data) {
-			var table = "<table class='table is-striped' id='historyResults'>";
-			if (data.length === 0) {
-				document.getElementById("historyStatus").innerHTML = "No history available (yet).";
-			} else {
-				table += "<thead><tr><th>Ended</th><th>Artist</th><th>Title</th></tr></thead><tbody>"
-				data.reverse().forEach(function(song) {
-					var delta = Math.round((+(new Date()) - (new Date(String(song.Ended)))) / 1000);
-
-					var minute = 60
-					var hour = minute * 60
-					var day = hour * 24
-
-					var timeAgo;
-
-					if (delta < 30) {
-						timeAgo = 'just now';
-					} else if (delta < minute) {
-						timeAgo = delta + ' seconds ago';
-					} else if (delta < 2 * minute) {
-						timeAgo = 'a minute ago'
-					} else if (delta < hour) {
-						timeAgo = Math.floor(delta / minute) + ' minutes ago';
-					} else if (Math.floor(delta / hour) == 1) {
-						timeAgo = '1 hour ago'
-					} else if (delta < day) {
-						timeAgo = Math.floor(delta / hour) + ' hours ago';
-					}
-
-					table += "<tr><td>" + timeAgo + "</td><td>" + song.Artist + "</td><td>" + song.Title + "</td></tr>";
-				})
-				table += "</tbody>"		
-				document.getElementById("historyStatus").innerHTML = "";
-			}
-			table += "</table>";
-			document.getElementById("historyResults").innerHTML = table;
-		},
-		error: function() {	
-			document.getElementById("historyStatus").innerHTML = "Error. Could not get history.";
-		}
-	});
+function fetchListenURL() {
+  apiFetch('/api/listenurl')
+    .then(d => setStreamURL(d ? d.ListenURL : null))
+    .catch(() => setStreamURL(null));
 }
 
-function postSearch() {
-	var data = {};
-	data.search = $("#searchInput").val();
-	$.ajax({
-		type: "POST",
-		url: "/api/search",
-		contentType: "application/json",
-		data: JSON.stringify(data),
-		dataType: "json", // expects a json response
-		success: function (data) {
-			var table =
-				"<table class='table is-striped is-hoverable' id='searchResults'>";
-			if (data === null) {
-				// if no results from search
-				document.getElementById("requestStatus").innerHTML =
-					"Results: 0";
-				var input = $("#searchInput").val();
-				input = input.replace(/</g, "&lt;").replace(/>/g, "&gt;"); // Encode < and >, for error when placed back into no-results message
-			} else {
-				document.getElementById("requestStatus").innerHTML =
-					"Results: " + data.length;
-				table +=
-					"<thead><tr><th>Artist</th><th>Title</th><th>Availability</th></tr></thead><tbody>";
-				data.forEach(function (song) {
-					table +=
-						"<tr><td>" +
-						song.Artist +
-						"</td><td>" +
-						song.Title +
-						"</td><td><button class='button is-small is-light requestButton' data-id='" +
-						escape(song.ID) +
-						"'>Request</button></td></tr>";
-				});
-				table += "</tbody>";
-			}
-			table += "</table>";
-			document.getElementById("searchResults").innerHTML = table;
-		},
-		error: function () {
-			document.getElementById("requestStatus").innerHTML =
-				"Error. Could not execute search.";
-		},
-	});
+function setStreamURL(url) {
+  const statusEl = document.getElementById('status');
+  const streamEl = document.getElementById('stream');
+  if (!url || url === '-/-') {
+    streamEl.src = '';
+    statusEl.textContent = 'Waiting for stream...';
+    statusEl.className = 'nes-text is-warning';
+    return;
+  }
+  // If URL already has a protocol leave it alone; otherwise build from page protocol
+  if (!url.startsWith('http')) {
+    streamSrcURL = location.protocol + '//' + url;
+  } else {
+    streamSrcURL = url;
+  }
+  streamEl.src = streamSrcURL;
+  statusEl.innerHTML = 'Connected: <a href="' + streamSrcURL + '">' + streamSrcURL + '</a>';
+  statusEl.className = 'nes-text is-success';
 }
 
-function postRequestID() {
-	$(document).on("click", ".requestButton", function (e) {
-		var data = {};
-		data.ID = unescape(this.dataset.id);
-		$.ajax({
-			type: "POST",
-			url: "/api/request/id",
-			contentType: "application/json",
-			data: JSON.stringify(data),
-			success: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Request accepted!";
-			},
-			error: function () {
-				document.getElementById("requestStatus").innerHTML =
-					"Sorry, your request was not accepted. You may be rate limited.";
-			},
-		});
-	});
+function fetchHistory() {
+  apiFetch('/api/history')
+    .then(d => renderHistory(d))
+    .catch(() => {
+      document.getElementById('historyStatus').textContent = 'Error loading history.';
+    });
 }
 
-function connectRadioData() {
-	let eventSource = new EventSource("/api/radiodata/sse");
-	eventSource.onerror = function (event) {
-		eventSource.close();
-		setTimeout(function () {
-			connectRadioData();
-		}, 10000);
-	}
-	eventSource.addEventListener("title", function(event) {
-		$('#song').text(event.data)
-	})
-	eventSource.addEventListener("artist", function(event) {
-		$('#artist').text(event.data)
-	})
-	eventSource.addEventListener("listeners", function(event) {
-		if (event.data == -1) {
-			$("#listeners").html("N/A");
-		} else {
-			$("#listeners").html(event.data);
-		}
-	})
-	eventSource.addEventListener("title" || "artist" || "history", function() {
-		getNowPlayingAlbumArt()
-		getHistory()
-	})
-	eventSource.addEventListener("listenurl", function(event) {
-		if (event.data == "-/-") {
-			document.getElementById("stream").src = "";
-			$("#status").html("Disconnected from server.");
-		} else {
-			streamSrcURL = location.protocol + "//" + event.data;
-			document.getElementById("stream").src = streamSrcURL;
-			$("#status").html(
-				"Connected: <a href='" +
-					streamSrcURL +
-					"'>" +
-					streamSrcURL +
-					"</a>"
-			);
-		}
-	});
+function renderHistory(data) {
+  const statusEl  = document.getElementById('historyStatus');
+  const resultsEl = document.getElementById('historyResults');
+  if (!data || data.length === 0) {
+    statusEl.textContent = 'No history yet.';
+    resultsEl.innerHTML  = '';
+    return;
+  }
+  statusEl.textContent = '';
+  const rows = [...data].reverse().map(song => {
+    const delta = Math.round((Date.now() - new Date(song.Ended)) / 1000);
+    const timeAgo = formatDelta(delta);
+    return `<tr><td>${timeAgo}</td><td>${esc(song.Artist)}</td><td>${esc(song.Title)}</td></tr>`;
+  }).join('');
+  resultsEl.innerHTML =
+    `<table><thead><tr><th>Ended</th><th>Artist</th><th>Title</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function formatDelta(s) {
+  if (s < 30)         return 'just now';
+  if (s < 60)         return s + ' sec ago';
+  if (s < 120)        return '1 min ago';
+  if (s < 3600)       return Math.floor(s/60) + ' min ago';
+  if (s < 7200)       return '1 hour ago';
+  if (s < 86400)      return Math.floor(s/3600) + ' hours ago';
+  return Math.floor(s/86400) + ' days ago';
+}
+
+function esc(str) {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function bindSearch() {
+  let debounceTimer;
+  const input = document.getElementById('searchInput');
+  input.addEventListener('keyup', e => {
+    if (e.key === 'Enter') { doSearch(); return; }
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(doSearch, 300);
+  });
+}
+
+function doSearch() {
+  const query = document.getElementById('searchInput').value.trim();
+  if (!query) return;
+  apiFetch('/api/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search: query }),
+  })
+  .then(data => renderSearchResults(data))
+  .catch(() => {
+    document.getElementById('requestStatus').textContent = 'Search error.';
+  });
+}
+
+function renderSearchResults(data) {
+  const resultsEl = document.getElementById('searchResults');
+  const statusEl  = document.getElementById('requestStatus');
+  if (!data || data.length === 0) {
+    statusEl.textContent = 'No results.';
+    resultsEl.innerHTML  = '';
+    return;
+  }
+  statusEl.textContent = 'Results: ' + data.length;
+  const rows = data.map(song =>
+    `<tr>
+      <td>${esc(song.Artist)}</td>
+      <td>${esc(song.Title)}</td>
+      <td><button class="nes-btn is-primary is-small req-btn" data-id="${song.ID}">Request</button></td>
+    </tr>`
+  ).join('');
+  resultsEl.innerHTML =
+    `<table><thead><tr><th>Artist</th><th>Title</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function bindRequestButtons() {
+  document.getElementById('searchResults').addEventListener('click', e => {
+    if (!e.target.classList.contains('req-btn')) return;
+    const id = e.target.dataset.id;
+    apiFetch('/api/request/id', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ID: id }),
+    })
+    .then(() => {
+      document.getElementById('requestStatus').textContent = 'Request accepted!';
+    })
+    .catch(err => {
+      const msg = err.message === '429'
+        ? 'Rate limited. Try again later.'
+        : 'Request failed.';
+      document.getElementById('requestStatus').textContent = msg;
+    });
+  });
+}
+
+function connectSSE() {
+  const es = new EventSource('/api/radiodata/sse');
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectSSE, 10000);
+  };
+  es.addEventListener('title',   e => { document.getElementById('song').textContent   = e.data; });
+  es.addEventListener('artist',  e => { document.getElementById('artist').textContent = e.data; });
+  es.addEventListener('listeners', e => {
+    document.getElementById('listeners').textContent = e.data == '-1' ? 'N/A' : e.data;
+  });
+  // On title or artist update, refresh art + history
+  ['title', 'artist'].forEach(ev => {
+    es.addEventListener(ev, () => {
+      fetchNowPlayingAlbumArt();
+      fetchHistory();
+    });
+  });
+  es.addEventListener('listenurl', e => setStreamURL(e.data));
+  es.addEventListener('history',   () => fetchHistory());
 }

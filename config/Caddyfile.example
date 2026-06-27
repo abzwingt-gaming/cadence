@@ -1,0 +1,32 @@
+# Caddyfile.example - Cadence behind Caddy
+# Place in your main Caddyfile or import.
+# Replace radio.example.com with your domain.
+
+radio.example.com {
+    encode zstd gzip
+
+    header {
+        X-Frame-Options SAMEORIGIN
+        X-Content-Type-Options nosniff
+        X-Robots-Tag "noindex, nofollow"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        -Server
+    }
+
+    # Icecast audio stream - flush immediately for live streaming
+    handle /cadence1 {
+        reverse_proxy icecast2:8000 {
+            flush_interval -1
+        }
+    }
+
+    # Icecast status (optional, for external tools)
+    handle /status-json.xsl {
+        reverse_proxy icecast2:8000
+    }
+
+    # Cadence API + frontend
+    handle {
+        reverse_proxy cadence:8080
+    }
+}

@@ -19,10 +19,11 @@ type ServerConfig struct {
 	MusicDir          string
 	LiquidsoapAddress string
 	LiquidsoapPort    string
-	// Internal address cadence uses to poll Icecast status (server-side, Docker network)
+	// Internal status endpoint (Docker hostname, never leaves the network)
 	IcecastStatusURL  string
-	// Public stream URL sent to browser clients (e.g. https://radio.example.com/stream)
+	// Public stream URL sent to the browser
 	PublicStreamURL   string
+	DBBackend         string // "postgres" or "sqlite"
 	PostgresAddress   string
 	PostgresPort      string
 	PostgresUser      string
@@ -30,6 +31,7 @@ type ServerConfig struct {
 	PostgresDBName    string
 	PostgresTableName string
 	PostgresSSL       string
+	SQLitePath        string
 	RedisAddress      string
 	RedisPort         string
 	RedisPassword     string
@@ -37,95 +39,109 @@ type ServerConfig struct {
 	WhitelistPath     string
 	DevMode           bool
 	LogLevel          string
+	ScanWorkers       int
 }
 
 func parseLogLevel(level string) slog.Level {
-	if level == "" {
-		return slog.LevelInfo
-	}
 	switch strings.ToLower(level) {
 	case "debug":
 		return slog.LevelDebug
-	case "info":
-		return slog.LevelInfo
 	case "warn":
 		return slog.LevelWarn
 	case "error":
 		return slog.LevelError
 	default:
-		slog.Warn(fmt.Sprintf("Unrecognized log level '%s', defaulting to info.", level), "func", "parseLogLevel")
 		return slog.LevelInfo
 	}
 }
 
-// stripScheme removes http:// or https:// from an address string.
-// Cadence always prepends http:// internally for Icecast polling.
+// stripScheme removes http:// or https:// from addresses that must be host-only.
 func stripScheme(addr string) string {
 	for _, prefix := range []string{"https://", "http://"} {
 		if strings.HasPrefix(addr, prefix) {
-			slog.Warn(fmt.Sprintf("Scheme prefix found in address '%s' - stripping. Use host:port format.", addr),
-				"func", "stripScheme")
+			slog.Warn(fmt.Sprintf("Scheme prefix found in '%s', stripping. Use host:port format.", addr))
 			return strings.TrimPrefix(addr, prefix)
 		}
 	}
 	return addr
 }
 
-func main() {
-	c.Version = os.Getenv("CSERVER_VERSION")
-	c.RootPath = os.Getenv("CSERVER_ROOTPATH")
-	c.RequestRateLimit, _ = strconv.Atoi(os.Getenv("CSERVER_REQRATELIMIT"))
-	c.Port = os.Getenv("CSERVER_PORT")
-	c.MusicDir = os.Getenv("CSERVER_MUSIC_DIR")
-	c.LiquidsoapAddress = os.Getenv("CSERVER_LIQUIDSOAPADDRESS")
-	c.LiquidsoapPort = os.Getenv("CSERVER_LIQUIDSOAPPORT")
-
-	// Internal Icecast status URL (server-to-server, Docker network)
-	// Defaults to http://icecast2:8000 if not set
-	icecastHost := stripScheme(os.Getenv("CSERVER_ICECASTADDRESS"))
-	if icecastHost == "" {
-		icecastHost = "icecast2:8000"
+func envOrDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	c.IcecastStatusURL = "http://" + icecastHost + "/status-json.xsl"
+	return def
+}
 
-	// Public stream URL for browser audio element
-	// If not set, falls back to the Icecast host (original behavior)
-	c.PublicStreamURL = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
+func main() {
+	c.Version           = envOrDefault("CSERVER_VERSION", "dev")
+	c.RootPath          = envOrDefault("CSERVER_ROOTPATH", "/cadence/server/")
+	c.RequestRateLimit, _ = strconv.Atoi(envOrDefault("CSERVER_REQRATELIMIT", "5"))
+	c.Port              = envOrDefault("CSERVER_PORT", ":8080")
+	c.MusicDir          = os.Getenv("CSERVER_MUSIC_DIR")
+	c.LiquidsoapAddress = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
+	c.LiquidsoapPort    = envOrDefault("CSERVER_LIQUIDSOAPPORT", ":1234")
 
-	c.PostgresAddress = os.Getenv("CSERVER_POSTGRESADDRESS")
-	c.PostgresPort = os.Getenv("CSERVER_POSTGRESPORT")
-	c.PostgresUser = os.Getenv("CSERVER_POSTGRESUSER")
-	c.PostgresPassword = os.Getenv("POSTGRES_PASSWORD")
-	c.PostgresDBName = os.Getenv("CSERVER_POSTGRESDBNAME")
-	c.PostgresTableName = os.Getenv("CSERVER_POSTGRESTABLENAME")
-	c.PostgresSSL = os.Getenv("CSERVER_POSTGRESSSL")
-	c.RedisAddress = os.Getenv("CSERVER_REDISADDRESS")
-	c.RedisPort = os.Getenv("CSERVER_REDISPORT")
-	c.RedisPassword = os.Getenv("CSERVER_REDISPASSWORD")
-	c.RedisDB, _ = strconv.Atoi(os.Getenv("CSERVER_REDISDB"))
-	c.WhitelistPath = os.Getenv("CSERVER_WHITELIST_PATH")
-	c.DevMode, _ = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
-	c.LogLevel = os.Getenv("CSERVER_LOGLEVEL")
+	// Internal Icecast status URL (used only by server, never forwarded to client)
+	c.IcecastStatusURL  = envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000")
+	// Trim trailing slash
+	c.IcecastStatusURL  = strings.TrimRight(c.IcecastStatusURL, "/")
+	// Public stream URL sent to browser - defaults to same as status host but can differ
+	c.PublicStreamURL   = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
+
+	c.DBBackend         = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "postgres"))
+	c.PostgresAddress   = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "postgres"))
+	c.PostgresPort      = envOrDefault("CSERVER_POSTGRESPORT", "5432")
+	c.PostgresUser      = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
+	c.PostgresPassword  = os.Getenv("POSTGRES_PASSWORD")
+	c.PostgresDBName    = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
+	c.PostgresTableName = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
+	c.PostgresSSL       = envOrDefault("CSERVER_POSTGRESSSL", "disable")
+	c.SQLitePath        = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
+
+	c.RedisAddress      = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "redis"))
+	c.RedisPort         = envOrDefault("CSERVER_REDISPORT", ":6379")
+	c.RedisPassword     = os.Getenv("CSERVER_REDISPASSWORD")
+	c.RedisDB, _        = strconv.Atoi(envOrDefault("CSERVER_REDISDB", "0"))
+
+	c.WhitelistPath     = os.Getenv("CSERVER_WHITELIST_PATH")
+	c.DevMode, _        = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
+	c.LogLevel          = envOrDefault("CSERVER_LOGLEVEL", "info")
+	c.ScanWorkers, _    = strconv.Atoi(envOrDefault("CSERVER_SCAN_WORKERS", "4"))
 
 	slog.SetLogLoggerLevel(parseLogLevel(c.LogLevel))
 
-	slog.Info("Starting Cadence (homelab build).", "version", c.Version)
-	slog.Info(fmt.Sprintf("Icecast status URL: %s", c.IcecastStatusURL))
-	if c.PublicStreamURL != "" {
-		slog.Info(fmt.Sprintf("Public stream URL override: %s", c.PublicStreamURL))
+	// Validate required config
+	if c.MusicDir == "" {
+		slog.Warn("CSERVER_MUSIC_DIR is not set; database will not be populated.")
 	}
 
-	if postgresInit() == nil {
-		if postgresPopulate() != nil {
-			slog.Warn("Initial database population failed.", "func", "main")
+	// Init DB backend
+	switch c.DBBackend {
+	case "sqlite":
+		if err := sqliteInit(); err != nil {
+			slog.Warn("SQLite init failed.", "error", err)
+		} else {
+			if err := dbPopulate(); err != nil {
+				slog.Warn("Initial DB population failed.", "error", err)
+			}
+		}
+	default: // postgres
+		if err := postgresInit(); err != nil {
+			slog.Warn("Postgres init failed.", "error", err)
+		} else {
+			if err := dbPopulate(); err != nil {
+				slog.Warn("Initial DB population failed.", "error", err)
+			}
 		}
 	}
+
 	go redisInit()
 	go filesystemMonitor()
 	go icecastMonitor()
 
-	slog.Info(fmt.Sprintf("Listening on port %s.", c.Port), "func", "main")
+	slog.Info(fmt.Sprintf("Starting Cadence %s on %s [db=%s]", c.Version, c.Port, c.DBBackend))
 	if err := http.ListenAndServe(c.Port, routes()); err != nil {
-		slog.Error("Cadence failed to start!", "func", "main", "error", err)
+		slog.Error("Cadence failed to start!", "error", err)
 	}
 }

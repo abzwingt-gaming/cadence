@@ -1,0 +1,105 @@
+# Cadence homelab docker-compose
+# Profiles:
+#   postgres (default db)  - include: postgres service
+#   sqlite   (lightweight) - no postgres, uses local sqlite file
+#   redis                  - optional rate limiting
+#
+# Minimal start (SQLite, no Redis):
+#   docker compose up -d
+#
+# Full stack with Postgres + Redis:
+#   docker compose --profile postgres --profile redis up -d
+
+services:
+
+  icecast2:
+    build:
+      dockerfile: ./src/icecast2.Dockerfile
+    image: cadence_icecast2
+    container_name: icecast2
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config/icecast.xml:/etc/icecast/cadence.xml:ro
+    networks:
+      - services-net
+      - stream-net
+
+  liquidsoap:
+    build:
+      dockerfile: ./src/liquidsoap.Dockerfile
+    image: cadence_liquidsoap
+    container_name: liquidsoap
+    restart: unless-stopped
+    volumes:
+      - ./config/liquidsoap.liq:/etc/liquidsoap/cadence.liq:ro
+      - ${MUSIC_DIR}:${MUSIC_DIR}:ro
+    depends_on:
+      - icecast2
+    expose:
+      - "1234"
+    networks:
+      - services-net
+      - stream-net
+
+  cadence:
+    build:
+      context: ./src/
+      dockerfile: ./cadence.Dockerfile
+    image: cadence
+    container_name: cadence
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - ./config/cadence.env
+    volumes:
+      - ${MUSIC_DIR}:${MUSIC_DIR}:ro
+      - ./src/server/public/css/custom.css:/cadence/server/public/css/custom.css:ro
+      - ./data:/data  # sqlite db lives here
+    depends_on:
+      - icecast2
+      - liquidsoap
+    networks:
+      - services-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    profiles: ["postgres"]
+    image: postgres:16-alpine
+    container_name: cadence-postgres
+    restart: unless-stopped
+    expose:
+      - "5432"
+    env_file:
+      - ./config/cadence.env
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - services-net
+
+  redis:
+    profiles: ["redis"]
+    image: redis:7-alpine
+    container_name: cadence-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-}
+      --save ""
+      --appendonly no
+    expose:
+      - "6379"
+    networks:
+      - services-net
+
+networks:
+  services-net:
+    driver: bridge
+  stream-net:
+    driver: bridge
