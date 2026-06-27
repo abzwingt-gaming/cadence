@@ -19,11 +19,10 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
-var now   = RadioInfo{}
+var now = RadioInfo{}
 var nowMu sync.RWMutex
 
-var artCache    sync.Map
-var artCacheKey string
+var artCache sync.Map
 
 type RadioInfo struct {
 	Song       SongData
@@ -43,6 +42,17 @@ type SongData struct {
 	Path   string
 }
 
+// history is protected by historyMu.
+// Written in icecastMonitor goroutine, read in History() HTTP handler.
+var history   []playRecord
+var historyMu sync.Mutex
+
+type playRecord struct {
+	Title  string
+	Artist string
+	Ended  time.Time
+}
+
 func NowSnapshot() RadioInfo {
 	nowMu.RLock()
 	defer nowMu.RUnlock()
@@ -50,14 +60,14 @@ func NowSnapshot() RadioInfo {
 }
 
 // liquidsoapRequest pushes a path to Liquidsoap.
-// Mode: auto = try HTTP first, fall back to telnet.
+// CSERVER_LIQUIDSOAP_MODE: http | telnet | auto (default)
 func liquidsoapRequest(path string) (string, error) {
 	switch strings.ToLower(c.LiquidsoapMode) {
 	case "http":
 		return liquidsoapHTTP("request.push", path)
 	case "telnet":
 		return liquidsoapTelnet(fmt.Sprintf("request.push %s", path))
-	default: // auto
+	default: // auto: HTTP first, telnet fallback
 		if msg, err := liquidsoapHTTP("request.push", path); err == nil {
 			return msg, nil
 		}
@@ -81,16 +91,16 @@ func liquidsoapSkip() (string, error) {
 }
 
 // liquidsoapHTTP uses Liquidsoap 2.x HTTP harbor API.
-// Expects CSERVER_LIQUIDSOAPADDRESS:CSERVER_LIQUIDSOAP_HTTP_PORT to serve
-// the harbor endpoint at /api/<cmd>.
 func liquidsoapHTTP(cmd, arg string) (string, error) {
-	var body []byte
-	if arg != "" {
-		body = []byte(arg)
-	}
 	url := fmt.Sprintf("http://%s%s/api/%s",
 		c.LiquidsoapAddress, c.LiquidsoapHTTPPort, cmd)
-	resp, err := http.Post(url, "text/plain", bytes.NewReader(body))
+	var body *bytes.Reader
+	if arg != "" {
+		body = bytes.NewReader([]byte(arg))
+	} else {
+		body = bytes.NewReader(nil)
+	}
+	resp, err := http.Post(url, "text/plain", body)
 	if err != nil {
 		return "", err
 	}
@@ -99,12 +109,12 @@ func liquidsoapHTTP(cmd, arg string) (string, error) {
 	if resp.StatusCode >= 400 {
 		return "", fmt.Errorf("liquidsoap HTTP %d: %s", resp.StatusCode, res)
 	}
-	slog.Info("Liquidsoap HTTP response.", "cmd", cmd, "resp", strings.TrimSpace(string(res)))
+	slog.Info("Liquidsoap HTTP.", "cmd", cmd, "resp", strings.TrimSpace(string(res)))
 	return string(res), nil
 }
 
-// liquidsoapTelnet is the classic telnet protocol (liquidsoap 2.x needs
-// server.telnet = true in the .liq script).
+// liquidsoapTelnet uses the classic telnet protocol.
+// Requires server.telnet = true in the liquidsoap .liq script.
 func liquidsoapTelnet(cmd string) (string, error) {
 	conn, err := net.DialTimeout("tcp", c.LiquidsoapAddress+c.LiquidsoapPort, 5*time.Second)
 	if err != nil {
@@ -118,7 +128,7 @@ func liquidsoapTelnet(cmd string) (string, error) {
 		slog.Error("Liquidsoap telnet read failed.", "error", err)
 	}
 	fmt.Fprintf(conn, "quit\n")
-	slog.Info("Liquidsoap telnet response.", "cmd", cmd, "msg", strings.TrimSpace(msg))
+	slog.Info("Liquidsoap telnet.", "cmd", cmd, "msg", strings.TrimSpace(msg))
 	return msg, nil
 }
 
@@ -147,9 +157,12 @@ func filesystemMonitor() {
 				debounce.Stop()
 			}
 			debounce = time.AfterFunc(3*time.Second, func() {
-				slog.Info("Music dir changed, repopulating DB.")
-				if err := dbPopulate(); err != nil {
-					slog.Error("Repopulate failed.", "error", err)
+				if rescanRunning.CompareAndSwap(false, true) {
+					defer rescanRunning.Store(false)
+					slog.Info("Music dir changed, repopulating DB.")
+					if err := dbPopulate(); err != nil {
+						slog.Error("Repopulate failed.", "error", err)
+					}
 				}
 			})
 		case err, ok := <-watcher.Errors:
@@ -193,7 +206,7 @@ func icecastMonitor() {
 			return
 		}
 		artistVal := j.Path("icestats.source.artist").Data()
-		titleVal  := j.Path("icestats.source.title").Data()
+		titleVal := j.Path("icestats.source.title").Data()
 		if artistVal == nil || titleVal == nil {
 			reset()
 			return
@@ -201,7 +214,7 @@ func icecastMonitor() {
 
 		nowMu.Lock()
 		now.Song.Artist = artistVal.(string)
-		now.Song.Title  = titleVal.(string)
+		now.Song.Title = titleVal.(string)
 		if h := j.Path("icestats.host").Data(); h != nil {
 			now.Host = h.(string)
 		}
@@ -221,12 +234,13 @@ func icecastMonitor() {
 		if prev.Song.Title != nowSnap.Song.Title || prev.Song.Artist != nowSnap.Song.Artist {
 			slog.Info("Now Playing.", "title", nowSnap.Song.Title, "artist", nowSnap.Song.Artist)
 			artCache = sync.Map{}
-			if redisAvailable {
+			if redisAvailable.Load() {
 				dbr.RateLimitArt.FlushDB(ctx)
 			}
 			radiodata_sse.SendEventMessage(nowSnap.Song.Title, "title", "")
 			radiodata_sse.SendEventMessage(nowSnap.Song.Artist, "artist", "")
 			if prev.Song.Title != "" && prev.Song.Artist != "" {
+				historyMu.Lock()
 				history = append(history, playRecord{
 					Title:  prev.Song.Title,
 					Artist: prev.Song.Artist,
@@ -235,6 +249,7 @@ func icecastMonitor() {
 				if len(history) > 10 {
 					history = history[1:]
 				}
+				historyMu.Unlock()
 				radiodata_sse.SendEventMessage("update", "history", "")
 			}
 		}
@@ -258,12 +273,4 @@ func icecastMonitor() {
 		time.Sleep(1 * time.Second)
 		check()
 	}
-}
-
-var history = make([]playRecord, 0, 10)
-
-type playRecord struct {
-	Title  string
-	Artist string
-	Ended  time.Time
 }
