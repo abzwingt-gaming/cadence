@@ -24,15 +24,14 @@ var audioExtensions = map[string]bool{
 }
 
 var artworkFallbackNames = []string{
-	"cover.jpg", "cover.png", "folder.jpg", "folder.png", "album.jpg", "album.png",
+	"cover.jpg", "cover.png", "folder.jpg", "folder.png",
+	"album.jpg", "album.png", "front.jpg", "front.png",
 }
 
-// cleanupMu guards titleCleanupRe and artistCleanupRe.
 var cleanupMu      sync.RWMutex
 var titleCleanupRe  []*regexp.Regexp
 var artistCleanupRe []*regexp.Regexp
 
-// resetCleanupRe clears compiled patterns so they are rebuilt on next use.
 func resetCleanupRe() {
 	cleanupMu.Lock()
 	titleCleanupRe = nil
@@ -126,9 +125,7 @@ func ArtworkPath(audioPath string) string {
 	return ""
 }
 
-// guessFromFilename extracts artist and title from common filename patterns:
-// "Artist - Title", "Artist_-_Title".
-// Returns ("", title) if no separator is found.
+// guessFromFilename extracts artist and title from "Artist - Title" patterns.
 func guessFromFilename(path string) (artist, title string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	base = strings.ReplaceAll(base, "_-_", " - ")
@@ -148,12 +145,13 @@ func searchByQuery(query string) ([]SongData, error) {
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByQuery(query)
 	}
-	// Use ILIKE for case-insensitive match; levenshtein for relevance ranking.
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE artist ILIKE $1 OR title ILIKE $2
-		 ORDER BY LEAST(levenshtein(lower($3), lower(artist)), levenshtein(lower($4), lower(title)))
-		 LIMIT 200`,
+		 ORDER BY LEAST(
+		   levenshtein(lower($3), lower(artist)),
+		   levenshtein(lower($4), lower(title))
+		 ) LIMIT 200`,
 		c.PostgresTableName)
 	rows, err := dbp.Query(sel, "%"+query+"%", "%"+query+"%", query, query)
 	if err != nil {
@@ -174,7 +172,6 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByTitleArtist(title, artist)
 	}
-	// Use ILIKE so Icecast casing differences don't break now-playing lookup.
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE title ILIKE $1 AND artist ILIKE $2 LIMIT 5`,
@@ -188,15 +185,20 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	return scanSongs(rows)
 }
 
+// getPathById fetches the file path for a song ID.
+// Uses correct placeholder syntax per backend (? for SQLite, $1 for Postgres).
 func getPathById(id int) (string, error) {
-	table := c.PostgresTableName
+	var (
+		query string
+		arg   interface{} = id
+	)
 	if c.DBBackend == "sqlite" {
-		table = "metadata"
+		query = `SELECT path FROM metadata WHERE id=?`
+	} else {
+		query = fmt.Sprintf(`SELECT path FROM %s WHERE id=$1`, c.PostgresTableName)
 	}
 	var path string
-	err := dbActive.QueryRow(
-		fmt.Sprintf(`SELECT path FROM %s WHERE id=$1`, table), id,
-	).Scan(&path)
+	err := dbActive.QueryRow(query, arg).Scan(&path)
 	if err == sql.ErrNoRows {
 		slog.Warn("Song not found by id.", "id", id)
 		return "", fmt.Errorf("song id %d not found", id)
@@ -211,7 +213,6 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 	var results []SongData
 	for rows.Next() {
 		var s SongData
-		// Year is scanned as string to match VARCHAR/TEXT column type.
 		if err := rows.Scan(&s.ID, &s.Artist, &s.Title, &s.Album, &s.Genre, &s.Year); err != nil {
 			slog.Warn("Row scan error, skipping.", "error", err)
 			continue
@@ -259,8 +260,6 @@ func dbPopulate() error {
 	}
 	slog.Info("Starting scan.", "files", len(files), "workers", workers)
 
-	// Use a semaphore channel instead of buffering all paths at once,
-	// to avoid large memory allocation for huge libraries.
 	sem := make(chan struct{}, workers)
 	var (
 		wg      sync.WaitGroup
@@ -283,7 +282,6 @@ func dbPopulate() error {
 			}
 			mu.Lock()
 			if upsertErr != nil {
-				slog.Warn("Upsert failed.", "path", path, "error", upsertErr)
 				skipped++
 			} else {
 				scanned++
@@ -296,8 +294,6 @@ func dbPopulate() error {
 	return nil
 }
 
-// extractTags reads ID3/Vorbis/MP4 tags from path.
-// Falls back to filename parsing ("Artist - Title") when tags are missing.
 func extractTags(path string) (title, album, artist, genre, year string) {
 	guessArtist, guessTitle := guessFromFilename(path)
 

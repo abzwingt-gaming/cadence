@@ -10,6 +10,8 @@ import (
 
 var radiodata_sse = eventsource.New(nil, nil)
 
+// routes returns the mux without any logging wrapper.
+// Logging is applied once in main() via loggingMiddleware.
 func routes() http.Handler {
 	r := http.NewServeMux()
 	r.Handle("/api/radiodata/sse",       radiodata_sse)
@@ -30,5 +32,5 @@ func routes() http.Handler {
 		r.Handle("/api/admin/rescan",    AdminRescan())
 	}
 	r.Handle("/", http.FileServer(http.Dir(c.RootPath)))
-	return loggingMiddleware(r)
+	return r
 }

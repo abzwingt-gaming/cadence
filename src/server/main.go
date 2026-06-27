@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// buildVersion is set at compile time: -ldflags "-X main.buildVersion=v1.2.3"
+// buildVersion is set at compile time via -ldflags "-X main.buildVersion=v1.2.3"
 var buildVersion = ""
 var c = ServerConfig{}
 
@@ -24,8 +24,8 @@ type ServerConfig struct {
 	Port                  string
 	MusicDir              string
 	LiquidsoapAddress     string
-	LiquidsoapPort        string
-	LiquidsoapHTTPPort    string
+	LiquidsoapPort        string // plain port, no colon, e.g. "1234"
+	LiquidsoapHTTPPort    string // plain port, no colon, e.g. "8001"
 	LiquidsoapMode        string
 	LiquidsoapTimeout     time.Duration
 	IcecastStatusURL      string
@@ -57,6 +57,12 @@ type ServerConfig struct {
 	TitleCleanupPatterns  string
 	ArtistCleanupPatterns string
 	PatternSeparator      string
+	// RealIPHeader: header set by Caddy/nginx with the real client IP.
+	// e.g. "X-Forwarded-For" or "X-Real-IP". Empty = use RemoteAddr.
+	RealIPHeader  string
+	// TrustedProxy: CIDR or IP of the upstream proxy. Only read RealIPHeader
+	// when RemoteAddr matches this. Empty = trust all (only safe on LAN).
+	TrustedProxy  string
 }
 
 func parseLogLevel(level string) slog.Level {
@@ -72,6 +78,13 @@ func parseLogLevel(level string) slog.Level {
 	}
 }
 
+func applyLogLevel() {
+	level := parseLogLevel(c.LogLevel)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	})))
+}
+
 func stripScheme(addr string) string {
 	for _, prefix := range []string{"https://", "http://"} {
 		if strings.HasPrefix(addr, prefix) {
@@ -80,6 +93,11 @@ func stripScheme(addr string) string {
 		}
 	}
 	return addr
+}
+
+// stripColon strips a leading colon from a port string (":8080" → "8080").
+func stripColon(port string) string {
+	return strings.TrimPrefix(port, ":")
 }
 
 func envOrDefault(key, def string) string {
@@ -121,43 +139,49 @@ func loadConfig() {
 	} else {
 		c.Version = envOrDefault("CSERVER_VERSION", "dev")
 	}
-	c.RootPath              = envOrDefault("CSERVER_ROOTPATH", "/app/public/")
-	c.Port                  = envOrDefault("CSERVER_PORT", ":8080")
-	c.MusicDir              = os.Getenv("CSERVER_MUSIC_DIR")
-	c.LiquidsoapAddress     = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
-	c.LiquidsoapPort        = envOrDefault("CSERVER_LIQUIDSOAPPORT", ":1234")
-	c.LiquidsoapHTTPPort    = envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", ":8001")
-	c.LiquidsoapMode        = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
-	c.LiquidsoapTimeout     = envDuration("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5000*time.Millisecond)
-	c.IcecastStatusURL      = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
-	c.IcecastPollInterval   = envDuration("CSERVER_ICECAST_POLL_INTERVAL_MS", 1000*time.Millisecond)
-	c.PublicStreamURL       = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
-	c.DBBackend             = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "postgres"))
-	c.DBRetries             = envInt("CSERVER_DB_RETRIES", 5)
-	c.DBRetryDelay          = envDuration("CSERVER_DB_RETRY_DELAY_MS", 3000*time.Millisecond)
-	c.PostgresAddress       = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "postgres"))
-	c.PostgresPort          = envOrDefault("CSERVER_POSTGRESPORT", "5432")
-	c.PostgresUser          = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
-	c.PostgresPassword      = os.Getenv("POSTGRES_PASSWORD")
-	c.PostgresDBName        = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
-	c.PostgresTableName     = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
-	c.PostgresSSL           = envOrDefault("CSERVER_POSTGRESSSL", "disable")
-	c.SQLitePath            = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
-	c.RedisAddress          = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "redis"))
-	c.RedisPort             = envOrDefault("CSERVER_REDISPORT", "6379")
-	c.RedisPassword         = os.Getenv("CSERVER_REDISPASSWORD")
-	c.RedisDB               = envInt("CSERVER_REDISDB", 0)
-	c.RequestRateLimit      = envInt("CSERVER_REQRATELIMIT", 5)
-	c.ArtRateLimitWindow    = envDuration("CSERVER_ART_RATELIMIT_WINDOW_MS", 200000*time.Millisecond)
-	c.ArtRateLimitMax       = envInt("CSERVER_ART_RATELIMIT_MAX", 16)
-	c.WhitelistPath         = os.Getenv("CSERVER_WHITELIST_PATH")
-	c.DevMode, _            = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
-	c.LogLevel              = envOrDefault("CSERVER_LOGLEVEL", "info")
-	c.ScanWorkers           = envInt("CSERVER_SCAN_WORKERS", 4)
-	c.HistorySize           = envInt("CSERVER_HISTORY_SIZE", 10)
-	c.FsnotifyDebounce      = envDuration("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3000*time.Millisecond)
-	c.PatternSeparator      = envOrDefault("CSERVER_PATTERN_SEPARATOR", ";;")
-	c.TitleCleanupPatterns  = envOrDefault("CSERVER_TITLE_CLEANUP_PATTERNS",
+	c.RootPath             = envOrDefault("CSERVER_ROOTPATH", "/app/public/")
+	c.Port                 = envOrDefault("CSERVER_PORT", ":8080")
+	c.MusicDir             = os.Getenv("CSERVER_MUSIC_DIR")
+	c.LiquidsoapAddress    = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
+	// Ports are stored WITHOUT colon. stripColon handles user input with or without.
+	c.LiquidsoapPort       = stripColon(envOrDefault("CSERVER_LIQUIDSOAPPORT", "1234"))
+	c.LiquidsoapHTTPPort   = stripColon(envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", "8001"))
+	c.LiquidsoapMode       = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
+	c.LiquidsoapTimeout    = envDuration("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5*time.Second)
+	c.IcecastStatusURL     = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
+	c.IcecastPollInterval  = envDuration("CSERVER_ICECAST_POLL_INTERVAL_MS", time.Second)
+	c.PublicStreamURL      = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
+	c.DBBackend            = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "sqlite"))
+	c.DBRetries            = envInt("CSERVER_DB_RETRIES", 5)
+	c.DBRetryDelay         = envDuration("CSERVER_DB_RETRY_DELAY_MS", 3*time.Second)
+	c.PostgresAddress      = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "cadence-postgres"))
+	c.PostgresPort         = stripColon(envOrDefault("CSERVER_POSTGRESPORT", "5432"))
+	c.PostgresUser         = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
+	c.PostgresPassword     = os.Getenv("POSTGRES_PASSWORD")
+	c.PostgresDBName       = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
+	c.PostgresTableName    = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
+	c.PostgresSSL          = envOrDefault("CSERVER_POSTGRESSSL", "disable")
+	c.SQLitePath           = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
+	c.RedisAddress         = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "cadence-redis"))
+	c.RedisPort            = stripColon(envOrDefault("CSERVER_REDISPORT", "6379"))
+	c.RedisPassword        = os.Getenv("CSERVER_REDISPASSWORD")
+	c.RedisDB              = envInt("CSERVER_REDISDB", 0)
+	c.RequestRateLimit     = envInt("CSERVER_REQRATELIMIT", 5)
+	c.ArtRateLimitWindow   = envDuration("CSERVER_ART_RATELIMIT_WINDOW_MS", 200*time.Second)
+	c.ArtRateLimitMax      = envInt("CSERVER_ART_RATELIMIT_MAX", 16)
+	c.WhitelistPath        = os.Getenv("CSERVER_WHITELIST_PATH")
+	c.DevMode, _           = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
+	c.LogLevel             = envOrDefault("CSERVER_LOGLEVEL", "info")
+	c.ScanWorkers          = envInt("CSERVER_SCAN_WORKERS", 4)
+	c.HistorySize          = envInt("CSERVER_HISTORY_SIZE", 10)
+	c.FsnotifyDebounce     = envDuration("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3*time.Second)
+	c.PatternSeparator     = envOrDefault("CSERVER_PATTERN_SEPARATOR", ";;")
+	// Behind Caddy: set CSERVER_REAL_IP_HEADER=X-Forwarded-For
+	// Behind nginx:  set CSERVER_REAL_IP_HEADER=X-Real-IP
+	// Direct (no proxy): leave empty
+	c.RealIPHeader         = os.Getenv("CSERVER_REAL_IP_HEADER")
+	c.TrustedProxy         = os.Getenv("CSERVER_TRUSTED_PROXY")
+	c.TitleCleanupPatterns = envOrDefault("CSERVER_TITLE_CLEANUP_PATTERNS",
 		`\s*[\(\[][^\)\]]*[Oo]fficial[^\)\]]*[\)\]]`+`;;`+
 		`\s*[\(\[][^\)\]]*[Ll]yrics?[^\)\]]*[\)\]]`+`;;`+
 		`\s*[\(\[][^\)\]]*[Aa]udio[^\)\]]*[\)\]]`+`;;`+
@@ -195,11 +219,10 @@ func initDB() {
 			time.Sleep(c.DBRetryDelay)
 		}
 	}
-	slog.Error("DB unreachable, giving up.", "backend", c.DBBackend, "attempts", c.DBRetries, "error", err)
+	slog.Error("DB unreachable after all retries.", "backend", c.DBBackend, "attempts", c.DBRetries, "last_error", err)
 	os.Exit(1)
 }
 
-// sighupReloading prevents concurrent SIGHUP-triggered reloads.
 var sighupReloading atomic.Bool
 
 func sighupHandler() {
@@ -207,14 +230,14 @@ func sighupHandler() {
 	signal.Notify(ch, syscall.SIGHUP)
 	for range ch {
 		if !sighupReloading.CompareAndSwap(false, true) {
-			slog.Warn("SIGHUP received but reload already in progress, skipping.")
+			slog.Warn("SIGHUP: reload already in progress, skipping.")
 			continue
 		}
 		go func() {
 			defer sighupReloading.Store(false)
 			slog.Info("SIGHUP: reloading config and rescanning music library.")
 			loadConfig()
-			slog.SetLogLoggerLevel(parseLogLevel(c.LogLevel))
+			applyLogLevel()
 			resetCleanupRe()
 			if err := dbPopulate(); err != nil {
 				slog.Error("Rescan after SIGHUP failed.", "error", err)
@@ -224,7 +247,7 @@ func sighupHandler() {
 	}
 }
 
-// loggingMiddleware logs method, path, status, and latency for every request.
+// loggingMiddleware logs every request at DEBUG level.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -252,7 +275,7 @@ func (sw *statusWriter) WriteHeader(code int) {
 
 func main() {
 	loadConfig()
-	slog.SetLogLoggerLevel(parseLogLevel(c.LogLevel))
+	applyLogLevel()
 
 	slog.Info("Cadence starting.",
 		"version", c.Version,
@@ -260,6 +283,7 @@ func main() {
 		"db", c.DBBackend,
 		"liquidsoap_mode", c.LiquidsoapMode,
 		"devmode", c.DevMode,
+		"real_ip_header", fmt.Sprintf("%q", c.RealIPHeader),
 	)
 
 	if c.MusicDir == "" {
@@ -273,6 +297,7 @@ func main() {
 	go icecastMonitor()
 	go sighupHandler()
 
+	// loggingMiddleware is applied ONCE here; routes() does NOT wrap again.
 	handler := loggingMiddleware(routes())
 	slog.Info("HTTP server listening.", "addr", c.Port)
 	if err := http.ListenAndServe(c.Port, handler); err != nil {
