@@ -21,6 +21,7 @@ type ServerConfig struct {
 	LiquidsoapPort    string
 	IcecastAddress    string
 	IcecastPort       string
+	StreamURL         string
 	PostgresAddress   string
 	PostgresPort      string
 	PostgresUser      string
@@ -30,6 +31,9 @@ type ServerConfig struct {
 	PostgresSSL       string
 	RedisAddress      string
 	RedisPort         string
+	RedisPassword     string
+	RedisDBRequest    int
+	RedisDBArt        int
 	WhitelistPath     string
 	DevMode           bool
 	LogLevel          string
@@ -39,7 +43,6 @@ func parseLogLevel(level string) slog.Level {
 	if level == "" {
 		return slog.LevelInfo
 	}
-
 	switch strings.ToLower(level) {
 	case "debug":
 		return slog.LevelDebug
@@ -55,6 +58,26 @@ func parseLogLevel(level string) slog.Level {
 	}
 }
 
+// stripScheme removes any http:// or https:// prefix from an address.
+func stripScheme(addr string) string {
+	for _, prefix := range []string{"https://", "http://"} {
+		if strings.HasPrefix(addr, prefix) {
+			slog.Warn(fmt.Sprintf("Scheme found in address '%s' - stripping. Use host:port format only.", addr),
+				"func", "stripScheme")
+			return strings.TrimPrefix(addr, prefix)
+		}
+	}
+	return addr
+}
+
+func envIntDefault(key string, def int) int {
+	v, err := strconv.Atoi(os.Getenv(key))
+	if err != nil {
+		return def
+	}
+	return v
+}
+
 func main() {
 	c.Version = os.Getenv("CSERVER_VERSION")
 	c.RootPath = os.Getenv("CSERVER_ROOTPATH")
@@ -63,8 +86,9 @@ func main() {
 	c.MusicDir = os.Getenv("CSERVER_MUSIC_DIR")
 	c.LiquidsoapAddress = os.Getenv("CSERVER_LIQUIDSOAPADDRESS")
 	c.LiquidsoapPort = os.Getenv("CSERVER_LIQUIDSOAPPORT")
-	c.IcecastAddress = os.Getenv("CSERVER_ICECASTADDRESS")
+	c.IcecastAddress = stripScheme(os.Getenv("CSERVER_ICECASTADDRESS"))
 	c.IcecastPort = os.Getenv("CSERVER_ICECASTPORT")
+	c.StreamURL = os.Getenv("CSERVER_STREAMURL") // public stream URL override for UI
 	c.PostgresAddress = os.Getenv("CSERVER_POSTGRESADDRESS")
 	c.PostgresPort = os.Getenv("CSERVER_POSTGRESPORT")
 	c.PostgresUser = os.Getenv("CSERVER_POSTGRESUSER")
@@ -74,6 +98,9 @@ func main() {
 	c.PostgresSSL = os.Getenv("CSERVER_POSTGRESSSL")
 	c.RedisAddress = os.Getenv("CSERVER_REDISADDRESS")
 	c.RedisPort = os.Getenv("CSERVER_REDISPORT")
+	c.RedisPassword = os.Getenv("CSERVER_REDISPASSWORD")
+	c.RedisDBRequest = envIntDefault("CSERVER_REDISDB_REQUEST", 0)
+	c.RedisDBArt = envIntDefault("CSERVER_REDISDB_ART", 1)
 	c.WhitelistPath = os.Getenv("CSERVER_WHITELIST_PATH")
 	c.DevMode, _ = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
 	c.LogLevel = os.Getenv("CSERVER_LOGLEVEL")
