@@ -15,6 +15,14 @@ document.addEventListener('DOMContentLoaded', () => {
   // Play/pause
   playBtn.addEventListener('click', () => {
     if (stream.paused) {
+      // streamSrcURL is set by the SSE 'listenurl' event (aria.js).
+      // Guard against clicking play before the stream URL has arrived.
+      if (!streamSrcURL) {
+        const st = document.getElementById('status');
+        st.textContent = 'Stream URL not yet received — please wait...';
+        st.className = 'nes-text is-warning';
+        return;
+      }
       stream.src = streamSrcURL;
       stream.load();
       stream.play();
