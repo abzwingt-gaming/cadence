@@ -1,33 +1,69 @@
-// routes.go
-// Routes incoming requests to functions written in api.go
-
 package main
 
 import (
+	"encoding/json"
 	"net/http"
+	"time"
 
-	"gopkg.in/antage/eventsource.v1"
+	eventsource "gopkg.in/antage/eventsource.v1"
 )
 
-var radiodata_sse = eventsource.New(nil, nil)
+var radiodata_sse eventsource.EventSource
 
-func routes() *http.ServeMux {
-	r := http.NewServeMux()
-	r.Handle("/api/radiodata/sse", radiodata_sse)
-	r.Handle("/api/search", Search())
-	r.Handle("/api/request/id", rateLimitRequest(RequestID()))
-	r.Handle("/api/request/bestmatch", rateLimitRequest(RequestBestMatch()))
-	r.Handle("/api/nowplaying/metadata", NowPlayingMetadata())
-	r.Handle("/api/nowplaying/albumart", rateLimitArt(NowPlayingAlbumArt()))
-	r.Handle("/api/history", History())
-	r.Handle("/api/listenurl", ListenURL())
-	r.Handle("/api/listeners", Listeners())
-	r.Handle("/api/bitrate", Bitrate())
-	r.Handle("/api/version", Version())
-	r.Handle("/ready", Ready())
+func routes() http.Handler {
+	radiodata_sse = eventsource.New(nil, func(req *http.Request) [][]byte {
+		return [][]byte{}
+	})
+
+	mux := http.NewServeMux()
+
+	// Health
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		type health struct {
+			Status   string `json:"status"`
+			Redis    bool   `json:"redis"`
+			Postgres bool   `json:"postgres"`
+			Uptime   string `json:"uptime"`
+		}
+		dbOK := dbp != nil && dbp.Ping() == nil
+		status := "ok"
+		if !dbOK {
+			status = "degraded"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(health{
+			Status:   status,
+			Redis:    redisAvailable,
+			Postgres: dbOK,
+			Uptime:   time.Since(startTime).Round(time.Second).String(),
+		})
+	})
+	mux.HandleFunc("/ready", Ready())
+
+	// Static files
+	fs := http.FileServer(http.Dir(c.RootPath + "public"))
+	mux.Handle("/", fs)
+
+	// SSE
+	mux.Handle("/api/radiodata/sse", radiodata_sse)
+
+	// Public API
+	mux.Handle("/api/search", http.HandlerFunc(Search()))
+	mux.Handle("/api/request/id", rateLimitRequest(http.HandlerFunc(RequestID())))
+	mux.Handle("/api/request/bestmatch", rateLimitRequest(http.HandlerFunc(RequestBestMatch())))
+	mux.Handle("/api/nowplaying/metadata", http.HandlerFunc(NowPlayingMetadata()))
+	mux.Handle("/api/nowplaying/albumart", rateLimitArt(http.HandlerFunc(NowPlayingAlbumArt())))
+	mux.Handle("/api/history", http.HandlerFunc(History()))
+	mux.Handle("/api/listenurl", http.HandlerFunc(ListenURL()))
+	mux.Handle("/api/listeners", http.HandlerFunc(Listeners()))
+	mux.Handle("/api/bitrate", http.HandlerFunc(Bitrate()))
+	mux.Handle("/api/version", http.HandlerFunc(Version()))
+
 	if c.DevMode {
-		r.Handle("/api/dev/skip", DevSkip())
+		mux.Handle("/api/dev/skip", http.HandlerFunc(DevSkip()))
 	}
-	r.Handle("/", http.FileServer(http.Dir(c.RootPath+"./public/")))
-	return r
+
+	return mux
 }
+
+var startTime = time.Now()

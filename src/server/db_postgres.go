@@ -18,138 +18,163 @@ import (
 
 var dbp *sql.DB
 
-func postgresInit() (err error) {
-	// We wait a bit to give some leeway for Postgres to finish startup.
-	// Obligatory: There's probably a better way to do this.
-	time.Sleep(5 * time.Second)
-	dsn := fmt.Sprintf("host='%s' port='%s' user='%s' password='%s' sslmode='%s'",
-		c.PostgresAddress, c.PostgresPort, c.PostgresUser, c.PostgresPassword, c.PostgresSSL)
-	dbp, err = sql.Open("postgres", dsn)
-	if err != nil {
-		slog.Error("Couldn't open a connection to database.", "func", "postgresInit", "error", err)
-		return err
-	}
-	err = dbp.Ping()
-	if err != nil {
-		slog.Error("Couldn't ping the metadata database.", "func", "postgresInit", "error", err)
-		return err
-	}
-	// Enable fuzzystrmatch for levenshtein sorting.
-	// This enables the database to return results based on search similarity.
-	slog.Debug("Enabling fuzzystrmatch extension...", "func", "postgresInit")
-	enableExtension := "CREATE EXTENSION fuzzystrmatch"
-	_, err = dbp.Exec(enableExtension)
-	if err != nil {
-		if err.(*pq.Error).Code == "42710" {
-			// 42710 also indicates an existing Postgres instance configured by another Cadence instance is still running.
-			slog.Debug("fuzzystrmatch already enabled on metadata database.", "func", "postgresInit")
-		} else {
-			slog.Error("Failed to enable fuzzystrmatch. Search will function in a degraded state.", "func", "postgresInit", "error", err)
-			return err
+func postgresInit() error {
+	dsn := fmt.Sprintf("host='%s' port='%s' user='%s' password='%s' dbname='%s' sslmode='%s'",
+		c.PostgresAddress, c.PostgresPort, c.PostgresUser, c.PostgresPassword, c.PostgresDBName, c.PostgresSSL)
+
+	// Retry up to 10 times with 3s delay instead of blind sleep
+	var err error
+	for i := 1; i <= 10; i++ {
+		dbp, err = sql.Open("postgres", dsn)
+		if err != nil {
+			slog.Warn(fmt.Sprintf("DB open failed (attempt %d/10): %v", i, err), "func", "postgresInit")
+			time.Sleep(3 * time.Second)
+			continue
 		}
+		err = dbp.Ping()
+		if err != nil {
+			slog.Warn(fmt.Sprintf("DB ping failed (attempt %d/10): %v", i, err), "func", "postgresInit")
+			time.Sleep(3 * time.Second)
+			continue
+		}
+		break
 	}
+	if err != nil {
+		slog.Error("Could not connect to Postgres after 10 attempts.", "func", "postgresInit", "error", err)
+		return err
+	}
+
+	// Enable fuzzystrmatch for levenshtein-based search ranking.
+	_, err = dbp.Exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
+	if err != nil {
+		// Some managed Postgres instances block this; degrade gracefully
+		slog.Warn("Could not enable fuzzystrmatch. Fuzzy search may be degraded.", "func", "postgresInit", "error", err)
+	}
+	slog.Info("Postgres connected.", "func", "postgresInit")
 	return nil
 }
 
 func postgresPopulate() error {
-	dropDatabase := fmt.Sprintf("DROP DATABASE IF EXISTS %s", c.PostgresDBName)
-	createDatabase := fmt.Sprintf("CREATE DATABASE %s", c.PostgresDBName)
+	// Use DROP TABLE / CREATE TABLE - never DROP DATABASE.
+	// Dropping the database from within the same connection is not supported
+	// in Postgres and causes: 'ERROR: cannot drop the currently open database'.
 	dropTable := fmt.Sprintf("DROP TABLE IF EXISTS %s", c.PostgresTableName)
-	createTable := fmt.Sprintf(`CREATE TABLE %s
-	(
-	   id serial PRIMARY KEY,
-	   title character varying(255),
-	   album character varying(255),
-	   artist character varying(255),
-	   genre character varying(255),
-	   year character varying(4),
-	   path character varying(510)
-	)
-	WITH (
-	   OIDS = FALSE
-	)`, c.PostgresTableName)
+	createTable := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id     SERIAL PRIMARY KEY,
+			title  VARCHAR(255),
+			album  VARCHAR(255),
+			artist VARCHAR(255),
+			genre  VARCHAR(255),
+			year   VARCHAR(4),
+			path   VARCHAR(510)
+		)`, c.PostgresTableName)
 
-	// Drop the database and rebuild it to start fresh.
-	slog.Debug(fmt.Sprintf("Deleting existing databases named <%s>...", c.PostgresDBName), "func", "postgresPopulate")
-	_, err := dbp.Exec(dropDatabase)
-	if err != nil {
-		slog.Error("Failed to remove existing dbp. Skipping remaining autoconfig steps.", "func", "postgresPopulate", "error", err)
-		return err
-	}
-	slog.Debug(fmt.Sprintf("Creating database <%s>...", c.PostgresDBName), "func", "postgresPopulate")
-	_, err = dbp.Exec(createDatabase)
-	if err != nil {
-		slog.Error("Failed to create database. Skipping remaining autoconfig steps.", "func", "postgresPopulate", "error", err)
-		return err
-	}
 	slog.Debug(fmt.Sprintf("Dropping table <%s>...", c.PostgresTableName), "func", "postgresPopulate")
-	_, err = dbp.Exec(dropTable)
+	_, err := dbp.Exec(dropTable)
 	if err != nil {
-		slog.Error("Failed to drop table. Skipping remaining autoconfig steps.", "func", "postgresPopulate", "error", err)
+		slog.Error("Failed to drop table.", "func", "postgresPopulate", "error", err)
 		return err
 	}
+
 	slog.Debug(fmt.Sprintf("Creating table <%s>...", c.PostgresTableName), "func", "postgresPopulate")
 	_, err = dbp.Exec(createTable)
 	if err != nil {
-		if err.(*pq.Error).Code == "42P07" {
-			// 42P10 indicates an existing metadata table configured by another Cadence instance is still running.
-			slog.Info("Metadata database already exists", "func", "postgresPopulate")
+		pqErr, ok := err.(*pq.Error)
+		if ok && pqErr.Code == "42P07" {
+			slog.Info("Metadata table already exists.", "func", "postgresPopulate")
 		} else {
-			slog.Error("Failed to build database table!", "func", "postgresPopulate", "error", err)
-			return err
-		}
-	}
-	slog.Debug("Verifying music metadata directory is accessible.")
-	_, err = os.Stat(c.MusicDir)
-	if err != nil {
-		slog.Error(fmt.Sprintf("Could not open music directory <%s> for verification.", c.MusicDir), "func", postgresPopulate, "error", err)
-		if os.IsNotExist(err) {
-			slog.Error("The configured target music directory was not found.", "func", "postgresPopulate", "error", err)
+			slog.Error("Failed to create table.", "func", "postgresPopulate", "error", err)
 			return err
 		}
 	}
 
-	insertInto := fmt.Sprintf("INSERT INTO %s (%s, %s, %s, %s, %s, %s) SELECT $1, $2, $3, $4, $5, $6", c.PostgresTableName, "title", "album", "artist", "genre", "year", "path")
-	slog.Debug(fmt.Sprintf("Extracting metadata from audio files in: <%s>", c.MusicDir), "func", "postgresPopulate")
+	_, err = os.Stat(c.MusicDir)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Music directory <%s> not accessible.", c.MusicDir), "func", "postgresPopulate", "error", err)
+		return err
+	}
+
+	insertInto := fmt.Sprintf(
+		"INSERT INTO %s (title, album, artist, genre, year, path) VALUES ($1, $2, $3, $4, $5, $6)",
+		c.PostgresTableName)
+
+	// Supported extensions
+	extensions := map[string]bool{
+		".mp3":  true,
+		".flac": true,
+		".ogg":  true,
+		".m4a":  true,
+		".opus": true,
+		".aac":  true,
+	}
+
+	var scanned, inserted, skipped int
+	slog.Info(fmt.Sprintf("Scanning music directory: %s", c.MusicDir), "func", "postgresPopulate")
+
 	err = filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Error("Error during filepath walk", "func", "postgresPopulate", "error", err)
-			return err
+			slog.Warn("Walk error, skipping path.", "func", "postgresPopulate", "path", path, "error", err)
+			return nil // continue walk
 		}
-		slog.Debug(fmt.Sprintf("Populate analyzing file: <%s>", path), "func", "postgresPopulate")
 		if info.IsDir() {
-			slog.Debug(fmt.Sprintf("<%s> is a directory, skipping.", path), "func", "postgresPopulate")
 			return nil
 		}
-		extensions := []string{".mp3", ".flac", ".ogg"}
-		for _, ext := range extensions {
-			if strings.HasSuffix(path, ext) {
-				file, err := os.Open(path)
-				if err != nil {
-					slog.Error(fmt.Sprintf("Problem opening directory <%s> for music population.", path), "func", "postgresPopulate", "error", err)
-					return err
-				}
-				defer file.Close()
-				tags, err := tag.ReadFrom(file)
-				if err != nil {
-					slog.Error(fmt.Sprintf("Problem fetching tags from <%s>.", path), "func", "postgresPopulate", "error", err)
-					return err
-				}
-				_, err = dbp.Exec(insertInto, tags.Title(), tags.Album(), tags.Artist(), tags.Genre(), tags.Year(), path)
-				if err != nil {
-					slog.Error(fmt.Sprintf("Problem populating metadata for <%s>.", path), "func", "postgresPopulate", "error", err)
-					return err
-				}
-				slog.Debug(fmt.Sprintf("Finished populating track: %s by %s", tags.Title(), tags.Artist()), "func", "postgresPopulate")
-				break
+		ext := strings.ToLower(filepath.Ext(path))
+		if !extensions[ext] {
+			return nil
+		}
+		scanned++
+
+		file, err := os.Open(path)
+		if err != nil {
+			slog.Warn("Could not open file, skipping.", "func", "postgresPopulate", "path", path, "error", err)
+			skipped++
+			return nil // continue walk, do not abort
+		}
+		defer file.Close()
+
+		// Read tags - use fallback values if tags missing or corrupt
+		title, album, artist, genre, year := "", "", "", "", ""
+		tags, err := tag.ReadFrom(file)
+		if err != nil {
+			slog.Warn("Could not read tags, using filename as title.", "func", "postgresPopulate", "path", path, "error", err)
+		} else {
+			title = strings.TrimSpace(tags.Title())
+			album = strings.TrimSpace(tags.Album())
+			artist = strings.TrimSpace(tags.Artist())
+			genre = strings.TrimSpace(tags.Genre())
+			if tags.Year() > 0 {
+				year = fmt.Sprintf("%d", tags.Year())
 			}
 		}
+
+		// Fallback for empty title: use filename without extension
+		if title == "" {
+			title = strings.TrimSuffix(filepath.Base(path), ext)
+		}
+		if artist == "" {
+			artist = "Unknown Artist"
+		}
+		if album == "" {
+			album = "Unknown Album"
+		}
+
+		_, err = dbp.Exec(insertInto, title, album, artist, genre, year, path)
+		if err != nil {
+			slog.Warn("Could not insert track, skipping.", "func", "postgresPopulate", "path", path, "error", err)
+			skipped++
+			return nil // continue walk
+		}
+		inserted++
+		slog.Debug(fmt.Sprintf("Indexed: %s - %s", artist, title), "func", "postgresPopulate")
 		return nil
 	})
 	if err != nil {
-		slog.Error("Music metadata database population failed, or may be incomplete.", "func", "postgresPopulate", "error", err)
+		slog.Error("Music directory walk failed.", "func", "postgresPopulate", "error", err)
 		return err
 	}
-	slog.Info("Database population completed.", "func", "postgresPopulate")
+	slog.Info(fmt.Sprintf("Database population done. scanned=%d inserted=%d skipped=%d", scanned, inserted, skipped),
+		"func", "postgresPopulate")
 	return nil
 }
