@@ -8,46 +8,47 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
+// buildVersion is set at compile time: -ldflags "-X main.buildVersion=v1.2.3"
 var buildVersion = ""
 var c = ServerConfig{}
 
 type ServerConfig struct {
-	Version              string
-	RootPath             string
-	RequestRateLimit     int
-	Port                 string
-	MusicDir             string
-	LiquidsoapAddress    string
-	LiquidsoapPort       string        // telnet port e.g. :1234
-	LiquidsoapHTTPPort   string        // HTTP harbor port e.g. :8001
-	LiquidsoapMode       string        // http | telnet | auto
-	IcecastStatusURL     string
-	PublicStreamURL      string
-	DBBackend            string
-	DBRetries            int
-	DBRetryDelay         time.Duration
-	PostgresAddress      string
-	PostgresPort         string
-	PostgresUser         string
-	PostgresPassword     string
-	PostgresDBName       string
-	PostgresTableName    string
-	PostgresSSL          string
-	SQLitePath           string
-	RedisAddress         string
-	RedisPort            string
-	RedisPassword        string
-	RedisDB              int
-	WhitelistPath        string
-	DevMode              bool
-	LogLevel             string
-	ScanWorkers          int
-	TitleCleanupPatterns string
+	Version               string
+	RootPath              string
+	RequestRateLimit      int
+	Port                  string
+	MusicDir              string
+	LiquidsoapAddress     string
+	LiquidsoapPort        string
+	LiquidsoapHTTPPort    string
+	LiquidsoapMode        string
+	IcecastStatusURL      string
+	PublicStreamURL       string
+	DBBackend             string
+	DBRetries             int
+	DBRetryDelay          time.Duration
+	PostgresAddress       string
+	PostgresPort          string
+	PostgresUser          string
+	PostgresPassword      string
+	PostgresDBName        string
+	PostgresTableName     string
+	PostgresSSL           string
+	SQLitePath            string
+	RedisAddress          string
+	RedisPort             string
+	RedisPassword         string
+	RedisDB               int
+	WhitelistPath         string
+	DevMode               bool
+	LogLevel              string
+	ScanWorkers           int
+	TitleCleanupPatterns  string
 	ArtistCleanupPatterns string
 }
 
@@ -87,36 +88,37 @@ func loadConfig() {
 	} else {
 		c.Version = envOrDefault("CSERVER_VERSION", "dev")
 	}
-	c.RootPath          = envOrDefault("CSERVER_ROOTPATH", "/cadence/server/")
+	c.RootPath = envOrDefault("CSERVER_ROOTPATH", "/cadence/server/")
 	c.RequestRateLimit, _ = strconv.Atoi(envOrDefault("CSERVER_REQRATELIMIT", "5"))
-	c.Port              = envOrDefault("CSERVER_PORT", ":8080")
-	c.MusicDir          = os.Getenv("CSERVER_MUSIC_DIR")
+	c.Port = envOrDefault("CSERVER_PORT", ":8080")
+	c.MusicDir = os.Getenv("CSERVER_MUSIC_DIR")
 	c.LiquidsoapAddress = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
-	c.LiquidsoapPort    = envOrDefault("CSERVER_LIQUIDSOAPPORT", ":1234")
+	c.LiquidsoapPort = envOrDefault("CSERVER_LIQUIDSOAPPORT", ":1234")
 	c.LiquidsoapHTTPPort = envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", ":8001")
-	c.LiquidsoapMode    = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
-	c.IcecastStatusURL  = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
-	c.PublicStreamURL   = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
-	c.DBBackend         = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "postgres"))
-	c.DBRetries, _      = strconv.Atoi(envOrDefault("CSERVER_DB_RETRIES", "5"))
-	retryMs, _          := strconv.Atoi(envOrDefault("CSERVER_DB_RETRY_DELAY_MS", "3000"))
-	c.DBRetryDelay      = time.Duration(retryMs) * time.Millisecond
-	c.PostgresAddress   = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "postgres"))
-	c.PostgresPort      = envOrDefault("CSERVER_POSTGRESPORT", "5432")
-	c.PostgresUser      = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
-	c.PostgresPassword  = os.Getenv("POSTGRES_PASSWORD")
-	c.PostgresDBName    = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
+	c.LiquidsoapMode = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
+	c.IcecastStatusURL = strings.TrimRight(
+		envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
+	c.PublicStreamURL = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
+	c.DBBackend = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "postgres"))
+	c.DBRetries, _ = strconv.Atoi(envOrDefault("CSERVER_DB_RETRIES", "5"))
+	retryMs, _ := strconv.Atoi(envOrDefault("CSERVER_DB_RETRY_DELAY_MS", "3000"))
+	c.DBRetryDelay = time.Duration(retryMs) * time.Millisecond
+	c.PostgresAddress = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "postgres"))
+	c.PostgresPort = envOrDefault("CSERVER_POSTGRESPORT", "5432")
+	c.PostgresUser = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
+	c.PostgresPassword = os.Getenv("POSTGRES_PASSWORD")
+	c.PostgresDBName = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
 	c.PostgresTableName = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
-	c.PostgresSSL       = envOrDefault("CSERVER_POSTGRESSSL", "disable")
-	c.SQLitePath        = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
-	c.RedisAddress      = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "redis"))
-	c.RedisPort         = envOrDefault("CSERVER_REDISPORT", ":6379")
-	c.RedisPassword     = os.Getenv("CSERVER_REDISPASSWORD")
-	c.RedisDB, _        = strconv.Atoi(envOrDefault("CSERVER_REDISDB", "0"))
-	c.WhitelistPath     = os.Getenv("CSERVER_WHITELIST_PATH")
-	c.DevMode, _        = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
-	c.LogLevel          = envOrDefault("CSERVER_LOGLEVEL", "info")
-	c.ScanWorkers, _    = strconv.Atoi(envOrDefault("CSERVER_SCAN_WORKERS", "4"))
+	c.PostgresSSL = envOrDefault("CSERVER_POSTGRESSSL", "disable")
+	c.SQLitePath = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
+	c.RedisAddress = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "redis"))
+	c.RedisPort = envOrDefault("CSERVER_REDISPORT", ":6379")
+	c.RedisPassword = os.Getenv("CSERVER_REDISPASSWORD")
+	c.RedisDB, _ = strconv.Atoi(envOrDefault("CSERVER_REDISDB", "0"))
+	c.WhitelistPath = os.Getenv("CSERVER_WHITELIST_PATH")
+	c.DevMode, _ = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
+	c.LogLevel = envOrDefault("CSERVER_LOGLEVEL", "info")
+	c.ScanWorkers, _ = strconv.Atoi(envOrDefault("CSERVER_SCAN_WORKERS", "4"))
 	c.TitleCleanupPatterns = envOrDefault("CSERVER_TITLE_CLEANUP_PATTERNS",
 		`\s*[\(\[][^\)\]]*[Oo]fficial[^\)\]]*[\)\]]|`+
 		`\s*[\(\[][^\)\]]*[Ll]yrics?[^\)\]]*[\)\]]|`+
@@ -127,9 +129,7 @@ func loadConfig() {
 		`\s*[\(\[][Mm]usic [Vv]ideo[^\)\]]*[\)\]]|`+
 		`\s*[\(\[](?:ft|feat)\.?[^\)\]]*[\)\]]`)
 	c.ArtistCleanupPatterns = envOrDefault("CSERVER_ARTIST_CLEANUP_PATTERNS",
-		`\s*- [Tt]opic$|`+
-		`\s*- [Vv][Ee][Vv][Oo]$|`+
-		`\s*[Oo]fficial$`)
+		`\s*- [Tt]opic$|\s*- [Vv][Ee][Vv][Oo]$|\s*[Oo]fficial$`)
 }
 
 func initDB() {
@@ -153,30 +153,27 @@ func initDB() {
 			time.Sleep(c.DBRetryDelay)
 		}
 	}
-	slog.Error(fmt.Sprintf("DB init failed after %d attempts.", c.DBRetries),
+	slog.Error(fmt.Sprintf("DB unreachable after %d attempts.", c.DBRetries),
 		"backend", c.DBBackend, "error", err)
 	os.Exit(1)
 }
 
-// sighupOnce prevents concurrent reloads if signals arrive in bursts.
-var sighupOnce sync.Mutex
+// sighupReloading prevents concurrent SIGHUP-triggered reloads.
+var sighupReloading atomic.Bool
 
 func sighupHandler() {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	for range ch {
-		if !sighupOnce.TryLock() {
+		if !sighupReloading.CompareAndSwap(false, true) {
+			slog.Warn("SIGHUP: reload already in progress, skipping.")
 			continue
 		}
 		go func() {
-			defer sighupOnce.Unlock()
-			slog.Info("SIGHUP received: reloading config and rescanning music directory.")
+			defer sighupReloading.Store(false)
+			slog.Info("SIGHUP: reloading config and rescanning.")
 			loadConfig()
-			// Reset compiled cleanup patterns so they're rebuilt with new config
-			titleCleanupRe = nil
-			titleCleanupOnce = sync.Once{}
-			artistCleanupRe = nil
-			artistCleanupOnce = sync.Once{}
+			resetCleanupRe()
 			if err := dbPopulate(); err != nil {
 				slog.Error("Rescan after SIGHUP failed.", "error", err)
 			}
