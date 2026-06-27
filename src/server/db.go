@@ -28,23 +28,20 @@ var artworkFallbackNames = []string{
 }
 
 // cleanupMu guards titleCleanupRe and artistCleanupRe.
-// resetCleanupRe() sets both to nil; ensureCleanupRe() rebuilds lazily.
-// This pattern is safe for SIGHUP hot-reload (no sync.Once reassignment).
 var cleanupMu      sync.RWMutex
 var titleCleanupRe  []*regexp.Regexp
 var artistCleanupRe []*regexp.Regexp
 
 // resetCleanupRe clears compiled patterns so they are rebuilt on next use.
-// Called by SIGHUP handler and AdminRescan.
 func resetCleanupRe() {
 	cleanupMu.Lock()
 	titleCleanupRe = nil
 	artistCleanupRe = nil
 	cleanupMu.Unlock()
+	slog.Debug("Cleanup patterns cleared; will recompile on next scan.")
 }
 
 func ensureCleanupRe() {
-	// Fast path
 	cleanupMu.RLock()
 	if titleCleanupRe != nil {
 		cleanupMu.RUnlock()
@@ -52,21 +49,27 @@ func ensureCleanupRe() {
 	}
 	cleanupMu.RUnlock()
 
-	// Slow path: build under write lock (double-checked)
 	cleanupMu.Lock()
 	defer cleanupMu.Unlock()
 	if titleCleanupRe != nil {
 		return
 	}
-	titleCleanupRe = compilePatterns(c.TitleCleanupPatterns)
-	artistCleanupRe = compilePatterns(c.ArtistCleanupPatterns)
+	sep := c.PatternSeparator
+	if sep == "" {
+		sep = ";;"
+	}
+	titleCleanupRe = compilePatterns(c.TitleCleanupPatterns, sep)
+	artistCleanupRe = compilePatterns(c.ArtistCleanupPatterns, sep)
 	slog.Info("Cleanup patterns compiled.",
-		"title", len(titleCleanupRe), "artist", len(artistCleanupRe))
+		"title_patterns", len(titleCleanupRe),
+		"artist_patterns", len(artistCleanupRe),
+		"separator", sep,
+	)
 }
 
-func compilePatterns(raw string) []*regexp.Regexp {
+func compilePatterns(raw, sep string) []*regexp.Regexp {
 	var out []*regexp.Regexp
-	for _, pat := range strings.Split(raw, "|") {
+	for _, pat := range strings.Split(raw, sep) {
 		pat = strings.TrimSpace(pat)
 		if pat == "" {
 			continue
@@ -110,8 +113,8 @@ func sanitize(s, fallback string) string {
 	return s
 }
 
-// ArtworkPath returns the path of a cover image in the same directory as
-// audioPath, or "" if none found.
+// ArtworkPath returns the first matching cover image in the same directory
+// as audioPath, or "" if none found.
 func ArtworkPath(audioPath string) string {
 	dir := filepath.Dir(audioPath)
 	for _, name := range artworkFallbackNames {
@@ -123,12 +126,11 @@ func ArtworkPath(audioPath string) string {
 	return ""
 }
 
-// guessFromFilename tries to extract Artist - Title from the filename.
-// Common patterns: "Artist - Title", "Artist_-_Title".
-// Returns empty strings if no separator found.
+// guessFromFilename extracts artist and title from common filename patterns:
+// "Artist - Title", "Artist_-_Title".
+// Returns ("", title) if no separator is found.
 func guessFromFilename(path string) (artist, title string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	// Normalise "_-_" separators used by some downloaders.
 	base = strings.ReplaceAll(base, "_-_", " - ")
 	parts := strings.SplitN(base, " - ", 2)
 	if len(parts) == 2 {
@@ -139,18 +141,23 @@ func guessFromFilename(path string) (artist, title string) {
 
 func searchByQuery(query string) ([]SongData, error) {
 	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("empty search query")
+	}
+	slog.Debug("searchByQuery.", "query", query, "backend", c.DBBackend)
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByQuery(query)
 	}
+	// Use ILIKE for case-insensitive match; levenshtein for relevance ranking.
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE artist ILIKE $1 OR title ILIKE $2
-		 ORDER BY LEAST(levenshtein($3, artist), levenshtein($4, title))
+		 ORDER BY LEAST(levenshtein(lower($3), lower(artist)), levenshtein(lower($4), lower(title)))
 		 LIMIT 200`,
 		c.PostgresTableName)
 	rows, err := dbp.Query(sel, "%"+query+"%", "%"+query+"%", query, query)
 	if err != nil {
-		slog.Error("searchByQuery failed.", "error", err)
+		slog.Error("searchByQuery failed.", "query", query, "error", err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -160,16 +167,21 @@ func searchByQuery(query string) ([]SongData, error) {
 func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	title = strings.TrimSpace(title)
 	artist = strings.TrimSpace(artist)
+	if title == "" {
+		return nil, fmt.Errorf("empty title in searchByTitleArtist")
+	}
+	slog.Debug("searchByTitleArtist.", "title", title, "artist", artist)
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByTitleArtist(title, artist)
 	}
+	// Use ILIKE so Icecast casing differences don't break now-playing lookup.
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
-		 WHERE title LIKE $1 AND artist LIKE $2 LIMIT 5`,
+		 WHERE title ILIKE $1 AND artist ILIKE $2 LIMIT 5`,
 		c.PostgresTableName)
 	rows, err := dbp.Query(sel, title, artist)
 	if err != nil {
-		slog.Error("searchByTitleArtist failed.", "error", err)
+		slog.Error("searchByTitleArtist failed.", "title", title, "artist", artist, "error", err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -186,7 +198,11 @@ func getPathById(id int) (string, error) {
 		fmt.Sprintf(`SELECT path FROM %s WHERE id=$1`, table), id,
 	).Scan(&path)
 	if err == sql.ErrNoRows {
+		slog.Warn("Song not found by id.", "id", id)
 		return "", fmt.Errorf("song id %d not found", id)
+	}
+	if err != nil {
+		slog.Error("getPathById query error.", "id", id, "error", err)
 	}
 	return path, err
 }
@@ -195,13 +211,18 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 	var results []SongData
 	for rows.Next() {
 		var s SongData
+		// Year is scanned as string to match VARCHAR/TEXT column type.
 		if err := rows.Scan(&s.ID, &s.Artist, &s.Title, &s.Album, &s.Genre, &s.Year); err != nil {
 			slog.Warn("Row scan error, skipping.", "error", err)
 			continue
 		}
 		results = append(results, s)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		slog.Error("Rows iteration error.", "error", err)
+		return results, err
+	}
+	return results, nil
 }
 
 func dbPopulate() error {
@@ -213,13 +234,14 @@ func dbPopulate() error {
 	}
 	if _, err := os.Stat(c.MusicDir); err != nil {
 		slog.Error("Music dir not accessible.", "dir", c.MusicDir, "error", err)
-		return err
+		return fmt.Errorf("music dir %q not accessible: %w", c.MusicDir, err)
 	}
 
+	slog.Info("Walking music directory.", "dir", c.MusicDir)
 	var files []string
 	err := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			slog.Warn("Walk error.", "path", path, "error", err)
+			slog.Warn("Walk error, skipping path.", "path", path, "error", err)
 			return nil
 		}
 		if !info.IsDir() && audioExtensions[strings.ToLower(filepath.Ext(path))] {
@@ -228,81 +250,74 @@ func dbPopulate() error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("walk error: %w", err)
 	}
 
 	workers := c.ScanWorkers
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
-	slog.Info(fmt.Sprintf("Scanning %d files, %d workers.", len(files), workers))
+	slog.Info("Starting scan.", "files", len(files), "workers", workers)
 
-	fileCh := make(chan string, len(files))
-	for _, f := range files {
-		fileCh <- f
-	}
-	close(fileCh)
-
+	// Use a semaphore channel instead of buffering all paths at once,
+	// to avoid large memory allocation for huge libraries.
+	sem := make(chan struct{}, workers)
 	var (
 		wg      sync.WaitGroup
 		mu      sync.Mutex
 		scanned int
 		skipped int
 	)
-	for i := 0; i < workers; i++ {
+	for _, f := range files {
 		wg.Add(1)
-		go func() {
+		sem <- struct{}{}
+		go func(path string) {
 			defer wg.Done()
-			for path := range fileCh {
-				title, album, artist, genre, year := extractTags(path)
-				var upsertErr error
-				if c.DBBackend == "sqlite" {
-					upsertErr = sqliteUpsert(title, album, artist, genre, year, path)
-				} else {
-					upsertErr = postgresUpsert(title, album, artist, genre, year, path)
-				}
-				mu.Lock()
-				if upsertErr != nil {
-					skipped++
-				} else {
-					scanned++
-				}
-				mu.Unlock()
+			defer func() { <-sem }()
+			title, album, artist, genre, year := extractTags(path)
+			var upsertErr error
+			if c.DBBackend == "sqlite" {
+				upsertErr = sqliteUpsert(title, album, artist, genre, year, path)
+			} else {
+				upsertErr = postgresUpsert(title, album, artist, genre, year, path)
 			}
-		}()
+			mu.Lock()
+			if upsertErr != nil {
+				slog.Warn("Upsert failed.", "path", path, "error", upsertErr)
+				skipped++
+			} else {
+				scanned++
+			}
+			mu.Unlock()
+		}(f)
 	}
 	wg.Wait()
-	slog.Info(fmt.Sprintf("Scan done: %d ok, %d skipped.", scanned, skipped))
+	slog.Info("Scan complete.", "scanned", scanned, "skipped", skipped, "total", len(files))
 	return nil
 }
 
 // extractTags reads ID3/Vorbis/MP4 tags from path.
-// Auto-repair: if title or artist are missing/generic, falls back to
-// filename parsing ("Artist - Title" pattern) so yt-dlp downloads get
-// correct metadata without manual tagging.
+// Falls back to filename parsing ("Artist - Title") when tags are missing.
 func extractTags(path string) (title, album, artist, genre, year string) {
 	guessArtist, guessTitle := guessFromFilename(path)
 
-	// Sane defaults from filename
 	title = cleanTitle(guessTitle)
 	artist = sanitize(guessArtist, "Unknown Artist")
 	album = "Unknown Album"
 
 	f, err := os.Open(path)
 	if err != nil {
-		slog.Warn("Cannot open for tag read.", "path", path)
+		slog.Warn("Cannot open file for tag read.", "path", path, "error", err)
 		return
 	}
 	defer f.Close()
 
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		// No tags at all — filename guess is already set above.
-		slog.Debug("No tags, using filename.", "path", path)
+		slog.Debug("No tags found, using filename fallback.", "path", path)
 		return
 	}
 
-	// Use tag values; fall back to filename-derived values when tag is empty.
 	if t := strings.TrimSpace(tags.Title()); t != "" {
 		title = cleanTitle(t)
 	}
@@ -310,6 +325,7 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 		artist = cleanArtist(a)
 	} else if guessArtist != "" {
 		artist = cleanArtist(guessArtist)
+		slog.Debug("Artist tag empty, using filename guess.", "path", path, "artist", artist)
 	}
 	if al := strings.TrimSpace(tags.Album()); al != "" {
 		album = al
