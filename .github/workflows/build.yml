@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: [master]
 
+# Needed for the auto-commit of go.mod/go.sum back to the branch.
+permissions:
+  contents: write
+
 jobs:
   go-build:
     name: Go build & tidy
@@ -18,6 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: actions/setup-go@v5
@@ -29,15 +34,17 @@ jobs:
         run: go mod tidy
 
       - name: Commit go.sum if changed
-        # Only commit back on branch pushes, not tags (tags are immutable)
-        if: github.ref_type == 'branch'
+        # Only on branch pushes; tags are immutable and PRs can't push back.
+        if: github.ref_type == 'branch' && github.event_name == 'push'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
           git diff --exit-code go.sum go.mod || (
             git add go.sum go.mod &&
             git commit -m "chore: go mod tidy [skip ci]" &&
-            git push
+            git push origin HEAD:${{ github.ref_name }}
           )
 
       - name: go build
