@@ -23,16 +23,50 @@ var audioExtensions = map[string]bool{
 	".m4a": true, ".opus": true, ".wav": true, ".aac": true,
 }
 
-// Artwork fallback filenames checked in order when no embedded art exists.
-var artworkFallbackNames = []string{"cover.jpg", "cover.png", "folder.jpg", "folder.png", "album.jpg", "album.png"}
+var artworkFallbackNames = []string{
+	"cover.jpg", "cover.png", "folder.jpg", "folder.png", "album.jpg", "album.png",
+}
 
-var titleCleanupRe   []*regexp.Regexp
-var titleCleanupOnce sync.Once
-var artistCleanupRe   []*regexp.Regexp
-var artistCleanupOnce sync.Once
+// cleanupMu guards titleCleanupRe and artistCleanupRe.
+// resetCleanupRe() sets both to nil; ensureCleanupRe() rebuilds lazily.
+// This pattern is safe for SIGHUP hot-reload (no sync.Once reassignment).
+var cleanupMu      sync.RWMutex
+var titleCleanupRe  []*regexp.Regexp
+var artistCleanupRe []*regexp.Regexp
 
-func buildCleanupRe(patterns string, dest *[]*regexp.Regexp) {
-	for _, pat := range strings.Split(patterns, "|") {
+// resetCleanupRe clears compiled patterns so they are rebuilt on next use.
+// Called by SIGHUP handler and AdminRescan.
+func resetCleanupRe() {
+	cleanupMu.Lock()
+	titleCleanupRe = nil
+	artistCleanupRe = nil
+	cleanupMu.Unlock()
+}
+
+func ensureCleanupRe() {
+	// Fast path
+	cleanupMu.RLock()
+	if titleCleanupRe != nil {
+		cleanupMu.RUnlock()
+		return
+	}
+	cleanupMu.RUnlock()
+
+	// Slow path: build under write lock (double-checked)
+	cleanupMu.Lock()
+	defer cleanupMu.Unlock()
+	if titleCleanupRe != nil {
+		return
+	}
+	titleCleanupRe = compilePatterns(c.TitleCleanupPatterns)
+	artistCleanupRe = compilePatterns(c.ArtistCleanupPatterns)
+	slog.Info("Cleanup patterns compiled.",
+		"title", len(titleCleanupRe), "artist", len(artistCleanupRe))
+}
+
+func compilePatterns(raw string) []*regexp.Regexp {
+	var out []*regexp.Regexp
+	for _, pat := range strings.Split(raw, "|") {
 		pat = strings.TrimSpace(pat)
 		if pat == "" {
 			continue
@@ -42,17 +76,9 @@ func buildCleanupRe(patterns string, dest *[]*regexp.Regexp) {
 			slog.Warn("Bad cleanup pattern, skipping.", "pattern", pat, "error", err)
 			continue
 		}
-		*dest = append(*dest, re)
+		out = append(out, re)
 	}
-	slog.Info(fmt.Sprintf("Cleanup patterns loaded: %d.", len(*dest)))
-}
-
-func buildTitleCleanupRe() {
-	titleCleanupOnce.Do(func() { buildCleanupRe(c.TitleCleanupPatterns, &titleCleanupRe) })
-}
-
-func buildArtistCleanupRe() {
-	artistCleanupOnce.Do(func() { buildCleanupRe(c.ArtistCleanupPatterns, &artistCleanupRe) })
+	return out
 }
 
 func applyRe(s string, res []*regexp.Regexp) string {
@@ -62,8 +88,19 @@ func applyRe(s string, res []*regexp.Regexp) string {
 	return strings.TrimSpace(s)
 }
 
-func cleanTitle(s string)  string { return applyRe(s, titleCleanupRe) }
-func cleanArtist(s string) string { return applyRe(s, artistCleanupRe) }
+func cleanTitle(s string) string {
+	cleanupMu.RLock()
+	res := titleCleanupRe
+	cleanupMu.RUnlock()
+	return applyRe(s, res)
+}
+
+func cleanArtist(s string) string {
+	cleanupMu.RLock()
+	res := artistCleanupRe
+	cleanupMu.RUnlock()
+	return applyRe(s, res)
+}
 
 func sanitize(s, fallback string) string {
 	s = strings.TrimSpace(s)
@@ -73,8 +110,8 @@ func sanitize(s, fallback string) string {
 	return s
 }
 
-// ArtworkPath returns embedded art from tags, or a fallback file path in the
-// same directory as audioPath. Returns "" if nothing found.
+// ArtworkPath returns the path of a cover image in the same directory as
+// audioPath, or "" if none found.
 func ArtworkPath(audioPath string) string {
 	dir := filepath.Dir(audioPath)
 	for _, name := range artworkFallbackNames {
@@ -84,6 +121,20 @@ func ArtworkPath(audioPath string) string {
 		}
 	}
 	return ""
+}
+
+// guessFromFilename tries to extract Artist - Title from the filename.
+// Common patterns: "Artist - Title", "Artist_-_Title".
+// Returns empty strings if no separator found.
+func guessFromFilename(path string) (artist, title string) {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	// Normalise "_-_" separators used by some downloaders.
+	base = strings.ReplaceAll(base, "_-_", " - ")
+	parts := strings.SplitN(base, " - ", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+	}
+	return "", strings.TrimSpace(base)
 }
 
 func searchByQuery(query string) ([]SongData, error) {
@@ -107,7 +158,7 @@ func searchByQuery(query string) ([]SongData, error) {
 }
 
 func searchByTitleArtist(title, artist string) ([]SongData, error) {
-	title  = strings.TrimSpace(title)
+	title = strings.TrimSpace(title)
 	artist = strings.TrimSpace(artist)
 	if c.DBBackend == "sqlite" {
 		return sqliteSearchByTitleArtist(title, artist)
@@ -154,8 +205,7 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 }
 
 func dbPopulate() error {
-	buildTitleCleanupRe()
-	buildArtistCleanupRe()
+	ensureCleanupRe()
 
 	if c.MusicDir == "" {
 		slog.Warn("CSERVER_MUSIC_DIR not set, skipping populate.")
@@ -226,11 +276,17 @@ func dbPopulate() error {
 	return nil
 }
 
+// extractTags reads ID3/Vorbis/MP4 tags from path.
+// Auto-repair: if title or artist are missing/generic, falls back to
+// filename parsing ("Artist - Title" pattern) so yt-dlp downloads get
+// correct metadata without manual tagging.
 func extractTags(path string) (title, album, artist, genre, year string) {
-	base   := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	title   = cleanTitle(base)
-	artist  = "Unknown Artist"
-	album   = "Unknown Album"
+	guessArtist, guessTitle := guessFromFilename(path)
+
+	// Sane defaults from filename
+	title = cleanTitle(guessTitle)
+	artist = sanitize(guessArtist, "Unknown Artist")
+	album = "Unknown Album"
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -241,14 +297,24 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		slog.Debug("Tag read failed, using filename.", "path", path)
+		// No tags at all — filename guess is already set above.
+		slog.Debug("No tags, using filename.", "path", path)
 		return
 	}
 
-	title  = cleanTitle(sanitize(tags.Title(),  base))
-	artist = cleanArtist(sanitize(tags.Artist(), "Unknown Artist"))
-	album  = sanitize(tags.Album(),  "Unknown Album")
-	genre  = sanitize(tags.Genre(),  "")
+	// Use tag values; fall back to filename-derived values when tag is empty.
+	if t := strings.TrimSpace(tags.Title()); t != "" {
+		title = cleanTitle(t)
+	}
+	if a := strings.TrimSpace(tags.Artist()); a != "" {
+		artist = cleanArtist(a)
+	} else if guessArtist != "" {
+		artist = cleanArtist(guessArtist)
+	}
+	if al := strings.TrimSpace(tags.Album()); al != "" {
+		album = al
+	}
+	genre = sanitize(tags.Genre(), "")
 	if y := tags.Year(); y > 0 {
 		year = fmt.Sprintf("%d", y)
 	}
