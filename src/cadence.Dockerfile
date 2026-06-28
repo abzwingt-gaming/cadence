@@ -2,7 +2,7 @@
 # Pure-Go build: CGO_ENABLED=0, no gcc required.
 # modernc.org/sqlite used instead of go-sqlite3 (no CGO).
 
-FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.22-alpine AS builder
+FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.23-alpine AS builder
 ARG TARGETPLATFORM BUILDPLATFORM TARGETOS TARGETARCH
 # Version injected at build time by CI (e.g. --build-arg CSERVER_VERSION=v1.2.3)
 ARG CSERVER_VERSION=dev
