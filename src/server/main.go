@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -96,10 +97,15 @@ func envInt(key string, def int) int {
 
 func envDur(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
+		// Accept Go duration strings ("5s", "200ms") first for readability,
+		// fall back to plain integer milliseconds for backward compat.
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 		if ms, err := strconv.Atoi(v); err == nil {
 			return time.Duration(ms) * time.Millisecond
 		}
-		slog.Warn("Invalid duration env var (expected ms).", "key", key, "default", def)
+		slog.Warn("Invalid duration env var (expected Go duration or ms integer).", "key", key, "default", def)
 	}
 	return def
 }
@@ -241,7 +247,6 @@ func applyLogLevel(conf *ServerConfig) {
 	key := strings.ToLower(conf.LogLevel)
 	lvl, ok := validLogLevels[key]
 	if !ok {
-		// BUG FIX: previously silently defaulted to INFO on typo.
 		slog.Warn("Unknown CSERVER_LOGLEVEL; defaulting to info.", "value", conf.LogLevel)
 		lvl = slog.LevelInfo
 	}
@@ -327,6 +332,9 @@ func main() {
 		"version", conf.Version,
 		"port", conf.Port,
 		"db", conf.DBBackend,
+		"sqlite_path", conf.SQLitePath,
+		"music_dir", conf.MusicDir,
+		"icecast_url", conf.IcecastStatusURL,
 		"liquidsoap_mode", conf.LiquidsoapMode,
 		"devmode", conf.DevMode,
 		"ratelimit_builtin", conf.RatelimitEnabled,
@@ -344,9 +352,6 @@ func main() {
 			dbErr = postgresInit()
 		}
 		if dbErr == nil {
-			// BUG FIX: set dbReady=true only after populate succeeds.
-			// Previously dbReady was never flipped — /readyz always returned 503
-			// until this line was added, and was never reset on DB loss.
 			if err := dbPopulate(); err != nil {
 				slog.Warn("Initial library scan failed.", "error", err)
 			}
@@ -368,9 +373,31 @@ func main() {
 	go icecastMonitor()
 	go sighupHandler()
 
+	// ── Graceful shutdown on SIGTERM / SIGINT ─────────────────────────────────
+	// Allows Docker / Portainer restacks to drain connections cleanly instead
+	// of hard-killing the process and leaving SSE clients in error state.
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, syscall.SIGTERM, syscall.SIGINT)
+
+	srv := &http.Server{
+		Addr:    conf.Port,
+		Handler: loggingMiddleware(routes()),
+	}
+
+	go func() {
+		sig := <-shutdownCh
+		slog.Info("Shutdown signal received; draining connections.", "signal", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			slog.Error("HTTP server shutdown error.", "error", err)
+		}
+	}()
+
 	slog.Info("HTTP server listening.", "addr", conf.Port)
-	if err := http.ListenAndServe(conf.Port, loggingMiddleware(routes())); err != nil {
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("HTTP server crashed.", "error", err)
 		os.Exit(1)
 	}
+	slog.Info("Cadence stopped gracefully.")
 }

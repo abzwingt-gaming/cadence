@@ -1,21 +1,25 @@
 // art.go — album art extraction with in-memory cache.
 // singleflight prevents duplicate concurrent reads for the same track.
+// TTL-based expiry prevents stale art after file-on-disk changes.
 
 package main
 
 import (
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/dhowden/tag"
 	"golang.org/x/sync/singleflight"
 )
 
 type artEntry struct {
-	data []byte
-	mime string
+	data     []byte
+	mime     string
+	cachedAt time.Time // FIX: added for TTL-based eviction
 }
 
 var (
@@ -23,6 +27,13 @@ var (
 	artCache = map[string]*artEntry{}
 	artSF    singleflight.Group
 )
+
+// artCacheTTL returns how long an art entry is valid.
+// Configurable via CSERVER_ART_CACHE_TTL_S (default 3600s).
+func artCacheTTL() time.Duration {
+	ttl := envInt("CSERVER_ART_CACHE_TTL_S", 3600)
+	return time.Duration(ttl) * time.Second
+}
 
 func inMemoryArtCacheClear() {
 	artMu.Lock()
@@ -33,14 +44,22 @@ func inMemoryArtCacheClear() {
 
 // albumArtForTrack returns embedded or directory cover art for the currently
 // playing track. Concurrent callers for the same key coalesce via singleflight.
+// Stale entries (older than artCacheTTL) are evicted on access.
 func albumArtForTrack(title, artist string) ([]byte, string, error) {
 	key := title + "\x00" + artist
+	ttl := artCacheTTL()
 
 	artMu.RLock()
 	e, hit := artCache[key]
 	artMu.RUnlock()
-	if hit {
+	if hit && time.Since(e.cachedAt) < ttl {
 		return e.data, e.mime, nil
+	}
+	// Evict stale entry so singleflight re-fetches.
+	if hit {
+		artMu.Lock()
+		delete(artCache, key)
+		artMu.Unlock()
 	}
 
 	type result struct {
@@ -73,7 +92,7 @@ func albumArtForTrack(title, artist string) ([]byte, string, error) {
 		}
 
 		artMu.Lock()
-		artCache[key] = &artEntry{data: data, mime: mime}
+		artCache[key] = &artEntry{data: data, mime: mime, cachedAt: time.Now()}
 		artMu.Unlock()
 
 		return result{data: data, mime: mime}, nil
@@ -115,9 +134,13 @@ func readFileArt(path string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", fmt.Errorf("read cover %q: %w", path, err)
 	}
-	mime := "image/jpeg"
-	if len(path) >= 4 && path[len(path)-4:] == ".png" {
-		mime = "image/png"
+	// FIX: was naive suffix check — misses .PNG, .webp, .gif, etc.
+	// Use stdlib content sniffing on the first 512 bytes instead.
+	mime := http.DetectContentType(data)
+	// DetectContentType may return "application/octet-stream" for some image
+	// formats it doesn't recognise; fall back to image/jpeg which is safest.
+	if mime == "application/octet-stream" {
+		mime = "image/jpeg"
 	}
 	return data, mime, nil
 }

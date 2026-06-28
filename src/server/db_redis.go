@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -25,7 +26,7 @@ import (
 
 var (
 	redisClient    *redis.Client
-	redisAvailable bool
+	redisAvailable atomic.Bool // FIX: was plain bool — data race between redisInit goroutine and HTTP handlers
 )
 
 // redisInit connects with exponential-backoff retries and runs a background
@@ -53,7 +54,7 @@ func redisInit() {
 			continue
 		}
 		redisClient = cl
-		redisAvailable = true
+		redisAvailable.Store(true)
 		slog.Info("Redis connected.", "addr", addr)
 		break
 	}
@@ -63,12 +64,12 @@ func redisInit() {
 	for range ticker.C {
 		if err := redisClient.Ping(context.Background()).Err(); err != nil {
 			slog.Warn("Redis ping failed; marking unavailable.", "error", err)
-			redisAvailable = false
+			redisAvailable.Store(false)
 			cl := redis.NewClient(opts)
 			if err2 := cl.Ping(context.Background()).Err(); err2 == nil {
 				_ = redisClient.Close()
 				redisClient = cl
-				redisAvailable = true
+				redisAvailable.Store(true)
 				slog.Info("Redis reconnected.", "addr", addr)
 			} else {
 				_ = cl.Close()
@@ -77,17 +78,18 @@ func redisInit() {
 	}
 }
 
-// artCacheClear removes art cache keys from Redis on track change.
+// artCacheClear removes rate-limit art cache keys from Redis on track change.
 // Uses SCAN+DEL to avoid blocking with FLUSHDB.
+// FIX: was "art:*" which never matched anything — keys are written as "rl:art:*".
 func artCacheClear() {
-	if !redisAvailable || redisClient == nil {
+	if !redisAvailable.Load() || redisClient == nil {
 		return
 	}
 	ctx := context.Background()
 	var cursor uint64
 	var keys []string
 	for {
-		batch, next, err := redisClient.Scan(ctx, cursor, "art:*", 100).Result()
+		batch, next, err := redisClient.Scan(ctx, cursor, "rl:art:*", 100).Result()
 		if err != nil {
 			slog.Warn("Redis SCAN failed during art cache clear.", "error", err)
 			return
@@ -120,7 +122,7 @@ var luaIncrWithTTL = redis.NewScript(`
 // Returns true (and writes 429) when the client is over limit.
 // No-op when RatelimitEnabled=false or Redis is unavailable.
 func rateLimitRequest(w http.ResponseWriter, r *http.Request) bool {
-	if !c().RatelimitEnabled || !redisAvailable || redisClient == nil {
+	if !c().RatelimitEnabled || !redisAvailable.Load() || redisClient == nil {
 		return false
 	}
 	ip, _ := realIP(r)
@@ -142,7 +144,7 @@ func rateLimitRequest(w http.ResponseWriter, r *http.Request) bool {
 
 // rateLimitArt enforces per-IP album-art rate limiting.
 func rateLimitArt(w http.ResponseWriter, r *http.Request) bool {
-	if !c().RatelimitEnabled || !redisAvailable || redisClient == nil {
+	if !c().RatelimitEnabled || !redisAvailable.Load() || redisClient == nil {
 		return false
 	}
 	ip, _ := realIP(r)
