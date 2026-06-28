@@ -50,16 +50,29 @@ var artistCleanupRe []*regexp.Regexp
 //	"01 - ", "02. ", "003 ", "1) "
 var trackPrefixRe = regexp.MustCompile(`^\d{1,4}[\s.\-)]*[-–]?\s*`)
 
-// ytdlpIDRe matches the YouTube video ID suffix that yt-dlp appends:
-//		"--<11-char-id>."
-//		"__<11-char-id>."
-//		" (<11-char-id>)."
-// The ID is always 11 base64url characters.
-var ytdlpIDRe = regexp.MustCompile(`(?:--|__| \()[A-Za-z0-9_-]{11}\)?(?:\.[a-z0-9]+)?$`)
+// ytdlpIDRe strips the YouTube video ID that yt-dlp appends to filenames.
+// Matches all known yt-dlp ID suffix formats:
+//
+//	--<id>   (double-dash, most common)
+//	__<id>   (double-underscore)
+//	[<id>]   (bracket, used by some yt-dlp versions / output templates)
+//	(<id>)   (parenthesis)
+//
+// The ID is always 11 base64url characters [A-Za-z0-9_-].
+// A trailing extension like ".mp3" is already stripped before this runs,
+// but the pattern is anchored to end-of-string for safety.
+var ytdlpIDRe = regexp.MustCompile(`(?:--|__| )\[?[A-Za-z0-9_-]{11}\]?$`)
 
-// ytdlpSepRe matches yt-dlp's triple-dash playlist/track separator:
-//		"Playlist-Title---001-Track-Title"
-var ytdlpSepRe = regexp.MustCompile(`-{3,}`)
+// ytdlpTrackSepRe finds the last occurrence of 3+ dashes that is immediately
+// followed by a track number (1-4 digits then a dash or end-of-string).
+// This lets us correctly split:
+//
+//	"Playlist-Title---Liquid-DnB---Afrobeat---001-track-name"
+//	                                        ^^^ last sep before track number
+var ytdlpTrackSepRe = regexp.MustCompile(`-{3,}(?=\d{1,4}[-\s]|\d{1,4}$)`)
+
+// ytdlpAnySepRe matches any run of 3+ dashes (used when no track number found).
+var ytdlpAnySepRe = regexp.MustCompile(`-{3,}`)
 
 func resetCleanupRe() {
 	cleanupMu.Lock()
@@ -168,7 +181,9 @@ func ArtworkPath(audioPath string) string {
 //
 //  1. yt-dlp playlist format:
 //     "Playlist-Title---NNN-Track-Title--<ytID>.mp3"
-//     → artist = playlist title (dashes→spaces), title = track title
+//     "Playlist---Sub---NNN-Track--<ytID>.mp3"  (multi-section playlist names)
+//     → artist = full playlist title (dashes→spaces), title = track title
+//     → album file (no track part): title = playlist name
 //
 //  2. "Artist - Title" (space-dash-space):
 //     "Pink Floyd - Comfortably Numb.flac"
@@ -180,29 +195,51 @@ func ArtworkPath(audioPath string) string {
 func guessFromFilename(path string) (artist, title string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 
-	// ── 1. yt-dlp playlist format ──────────────────────────────────────────
-	// Strip trailing YouTube ID ("--uMvFjbDAFbU" or "__uMvFjbDAFbU").
+	// ── 1. yt-dlp format ──────────────────────────────────────────────────
+	// Strip YouTube ID suffix in all known formats:
+	//   "--ID"  "__ID"  " [ID]"  " (ID)"
 	base = ytdlpIDRe.ReplaceAllString(base, "")
-	base = strings.TrimRight(base, "-_ ")
+	// Strip trailing punctuation left after ID removal (e.g. trailing dot in
+	// "tuna-dreams.--ID" → "tuna-dreams." → "tuna-dreams").
+	base = strings.TrimRight(base, "-_. ")
 
-	// Detect triple-dash separator: "Playlist---NNN-Track-Title"
-	if ytdlpSepRe.MatchString(base) {
-		parts := ytdlpSepRe.Split(base, 2)
-		playlist := dashesToSpaces(parts[0])
-		trackPart := ""
-		if len(parts) == 2 {
-			trackPart = parts[1]
-			// Strip leading track number from the track part ("005-track-title" → "track-title")
-			trackPart = trackPrefixRe.ReplaceAllString(trackPart, "")
-			trackPart = strings.TrimLeft(trackPart, "-")
-			trackPart = dashesToSpaces(trackPart)
+	// Detect yt-dlp triple-dash separator.
+	// Strategy: find the LAST separator that is followed by a track number
+	// ("---001-", "---12-"). This correctly handles playlist titles that
+	// themselves contain "---" subtitle sections:
+	//   "Playlist---Liquid-DnB---Afrobeat---001-track"
+	//                                    ^^^ split here
+	if ytdlpAnySepRe.MatchString(base) {
+		var playlistPart, trackPart string
+
+		if loc := ytdlpTrackSepRe.FindStringIndex(base); loc != nil {
+			// Found a sep before a track number — split there.
+			playlistPart = base[:loc[0]]
+			trackPart = base[loc[1]:] // skip the "---" itself
+		} else {
+			// No track number found — this is an album/intro file like
+			// "tuna-dreams.--ID" (already stripped to "tuna-dreams").
+			// Use the whole base as the title; no artist guess from filename.
+			parts := ytdlpAnySepRe.Split(base, 2)
+			playlistPart = parts[0]
+			if len(parts) == 2 && strings.TrimSpace(parts[1]) != "" {
+				trackPart = parts[1]
+			}
 		}
+
+		playlist := dashesToSpaces(playlistPart)
+
 		if trackPart == "" {
-			trackPart = playlist
-			playlist = ""
+			// Album/intro file — title is the playlist name.
+			return "", strings.TrimSpace(playlist)
 		}
-		// Title-case the result so "the night has its own bandwidth" → readable.
-		return strings.TrimSpace(playlist), strings.TrimSpace(trackPart)
+
+		// Strip leading track number from the track segment ("001-track" → "track").
+		trackPart = trackPrefixRe.ReplaceAllString(trackPart, "")
+		trackPart = strings.TrimLeft(trackPart, "-")
+		track := dashesToSpaces(trackPart)
+
+		return strings.TrimSpace(playlist), strings.TrimSpace(track)
 	}
 
 	// Replace remaining separators for the simpler patterns below.
@@ -222,7 +259,7 @@ func guessFromFilename(path string) (artist, title string) {
 		return "", right
 	}
 
-	// ── 3. Bare dash: "ArtistName-TrackTitle" ─────────────────────────────
+	// ── 3. Bare dash: "ArtistName-TrackTitle" ──────────────────────────────
 	// Only split if both sides are non-empty and neither is all-digits.
 	if parts := strings.SplitN(stripped, "-", 2); len(parts) == 2 {
 		left := strings.TrimSpace(parts[0])
@@ -232,14 +269,13 @@ func guessFromFilename(path string) (artist, title string) {
 		}
 	}
 
-	// ── 4. Fallback ────────────────────────────────────────────────────────
+	// ── 4. Fallback ─────────────────────────────────────────────────────────
 	return "", strings.TrimSpace(stripped)
 }
 
-// dashesToSpaces converts hyphen-separated-words to space separated words.
-// Single dashes between words become spaces; runs of dashes become one space.
+// dashesToSpaces converts hyphen/underscore-separated words to space-separated.
+// Runs of dashes or underscores collapse to a single space.
 func dashesToSpaces(s string) string {
-	// Replace any run of dashes/underscores with a single space.
 	re := regexp.MustCompile(`[-_]+`)
 	return strings.TrimSpace(re.ReplaceAllString(s, " "))
 }

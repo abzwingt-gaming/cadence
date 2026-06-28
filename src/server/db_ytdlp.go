@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -95,21 +96,78 @@ func (y *ytdlpInfo) BestYear() string {
 	return ""
 }
 
+// ytdlpBracketIDRe matches the bracket-format YouTube ID that some yt-dlp
+// output templates embed directly in the base filename:
+//
+//	"tuna dreams. [SYu0AncQtuY]"  →  stripped to  "tuna dreams."
+//
+// This is distinct from the dash-format ("--ID") handled by ytdlpIDRe in db.go.
+var ytdlpBracketIDRe = regexp.MustCompile(`\s*\[[A-Za-z0-9_-]{11}\]`)
+
 // ytdlpInfoCandidates returns sidecar paths to try, in preference order.
-// yt-dlp names the sidecar after the audio file with ".info.json" appended,
-// but when the file was converted after download the original extension may
-// still be part of the base name (e.g. "song.opus.info.json" → "song.info.json").
+//
+// yt-dlp can name sidecars in several ways depending on the output template:
+//
+//	1. Matching the audio filename exactly: "song--ID.info.json"
+//	2. Residual double-extension from pre-conversion: "song--ID.opus.info.json"
+//	3. Bracket ID format: "song [ID].info.json"  (common with %(title)s templates)
+//
+// All three variants are tried for every audio file.
 func ytdlpInfoCandidates(audioPath string) []string {
 	dir := filepath.Dir(audioPath)
 	base := strings.TrimSuffix(filepath.Base(audioPath), filepath.Ext(audioPath))
-	return []string{
+
+	candidates := []string{
+		// Exact match (most common — dash ID format).
 		filepath.Join(dir, base+".info.json"),
-		// Residual double-extension sidecars from pre-conversion downloads:
+		// Residual double-extension sidecars from pre-conversion downloads.
 		filepath.Join(dir, base+".opus.info.json"),
 		filepath.Join(dir, base+".webm.info.json"),
 		filepath.Join(dir, base+".m4a.info.json"),
 		filepath.Join(dir, base+".mp3.info.json"),
 	}
+
+	// Bracket ID format: strip "--ID" or "__ID" suffix from the base name,
+	// then re-add as " [ID].info.json" to match the bracket-template sidecar.
+	// Example: audio "tuna-dreams.--SYu0AncQtuY-.mp3"
+	//          sidecar "tuna dreams. [SYu0AncQtuY].info.json"
+	//
+	// We extract the raw ID from the audio filename, then scan the directory
+	// for any ".info.json" whose name contains that ID in bracket form.
+	if id := extractYTID(base); id != "" {
+		// Glob-style: walk dir entries for "*[ID].info.json".
+		entries, err := os.ReadDir(dir)
+		if err == nil {
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				if strings.HasSuffix(name, ".info.json") &&
+					strings.Contains(name, "["+id+"]") {
+					candidates = append(candidates, filepath.Join(dir, name))
+				}
+			}
+		}
+	}
+
+	return candidates
+}
+
+// extractYTID returns the 11-char YouTube ID embedded in a filename base,
+// or "" if none is found. Handles both dash ("--ID") and bracket ("[ID]") formats.
+func extractYTID(base string) string {
+	// Dash format: "--ID" or "__ID" at end of string.
+	dashRe := regexp.MustCompile(`(?:--|__)([A-Za-z0-9_-]{11})(?:-|$)`)
+	if m := dashRe.FindStringSubmatch(base); m != nil {
+		return m[1]
+	}
+	// Bracket format: "[ID]" anywhere.
+	bracketRe := regexp.MustCompile(`\[([A-Za-z0-9_-]{11})\]`)
+	if m := bracketRe.FindStringSubmatch(base); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 // loadYTDLPInfo tries to load a yt-dlp .info.json sidecar for audioPath.
