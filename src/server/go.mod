@@ -1,12 +1,13 @@
 module cadence
 
-go 1.23
+go 1.25.0
 
 require (
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.5.5
+	golang.org/x/sync v0.21.0
 	modernc.org/sqlite v1.31.1
 )
 
