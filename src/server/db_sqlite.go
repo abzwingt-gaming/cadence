@@ -16,27 +16,19 @@ var dbs *sql.DB
 
 func sqliteInit() error {
 	var err error
-	// WAL mode: supports multiple concurrent readers + one writer.
-	// busy_timeout=5000ms: readers/writers wait instead of returning SQLITE_BUSY.
-	// synchronous=NORMAL: safe under WAL (crash won't corrupt), faster than FULL.
-	// foreign_keys=on: referential integrity.
 	dsn := fmt.Sprintf(
 		"%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(on)",
-		c.SQLitePath,
+		c().SQLitePath,
 	)
-	slog.Info("Opening SQLite.", "path", c.SQLitePath)
+	slog.Info("Opening SQLite.", "path", c().SQLitePath)
 	dbs, err = sql.Open("sqlite", dsn)
 	if err != nil {
-		slog.Error("Cannot open SQLite.", "path", c.SQLitePath, "error", err)
+		slog.Error("Cannot open SQLite.", "path", c().SQLitePath, "error", err)
 		return err
 	}
-	// WAL mode allows multiple concurrent readers — do not cap to 1.
-	// Write serialisation is handled by SQLite's internal locking +
-	// busy_timeout. Capping to 1 would serialise reads during scan, hurting
-	// search latency.
-	dbs.SetMaxOpenConns(0) // unlimited (Go default)
+	dbs.SetMaxOpenConns(0)
 	if err = dbs.Ping(); err != nil {
-		slog.Error("Cannot ping SQLite.", "path", c.SQLitePath, "error", err)
+		slog.Error("Cannot ping SQLite.", "path", c().SQLitePath, "error", err)
 		return err
 	}
 	_, err = dbs.Exec(`
@@ -53,7 +45,7 @@ func sqliteInit() error {
 		slog.Error("Failed to create SQLite metadata table.", "error", err)
 		return err
 	}
-	slog.Info("SQLite ready.", "path", c.SQLitePath)
+	slog.Info("SQLite ready.", "path", c().SQLitePath)
 	dbActive = dbs
 	return nil
 }
@@ -90,10 +82,6 @@ func sqliteSearchByQuery(query string) ([]SongData, error) {
 	return scanSongs(rows)
 }
 
-// sqliteSearchByTitleArtist uses case-insensitive LIKE with wildcards for
-// parity with the Postgres ILIKE implementation.
-// Bare LIKE without % is exact match — Icecast metadata often differs
-// slightly from stored tags, so substring matching is required.
 func sqliteSearchByTitleArtist(title, artist string) ([]SongData, error) {
 	slog.Debug("sqliteSearchByTitleArtist.", "title", title, "artist", artist)
 	rows, err := dbs.Query(

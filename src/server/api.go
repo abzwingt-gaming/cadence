@@ -9,15 +9,10 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 )
 
 // ── realIP ────────────────────────────────────────────────────────────────────
-// Extracts the real client IP using the trusted proxy config.
-// Used by the built-in rate limiter (CSERVER_RATELIMIT_ENABLED=true) and logging.
-//
-// IMPORTANT: when running behind Caddy with RatelimitEnabled=false (default),
-// RemoteAddr is always Caddy's IP. The Caddy rate_limit directive sees real
-// client IPs before forwarding — use that for per-client limits in production.
 
 func realIP(r *http.Request) (string, error) {
 	conf := c()
@@ -57,8 +52,6 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
-// /livez — instant liveness. Caddy health_uri should point here.
-// /readyz — readiness. Returns 503 until DB is populated after startup.
 
 var dbReady atomic.Bool
 
@@ -92,15 +85,12 @@ func handleListeners(w http.ResponseWriter, r *http.Request) {
 
 func handleBitrate(w http.ResponseWriter, r *http.Request) {
 	nd := getNowPlaying()
-	// Available=false means Icecast is unreachable or stream is down, not "0 kbps".
 	writeJSON(w, http.StatusOK, map[string]any{
 		"Bitrate":   nd.Bitrate,
 		"Available": nd.Bitrate > 0,
 	})
 }
 
-// handleStatus is a merged endpoint returning all radio status in one request.
-// Prefer this over polling /listeners and /bitrate separately.
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	nd := getNowPlaying()
 	writeJSON(w, http.StatusOK, map[string]any{
