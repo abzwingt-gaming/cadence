@@ -1,30 +1,26 @@
-# Cadence docker-compose
+# Cadence docker-compose — Portainer-ready
+#
+# Images are pre-built locally by install.sh (docker build).
+# Copy this file into Portainer as a Stack — no source checkout needed.
 #
 # Profiles:
-#   (none)    — cadence + icecast + liquidsoap + SQLite  [recommended for homelab]
-#   postgres  — adds postgres service, set CSERVER_DB_BACKEND=postgres in cadence.env
-#   redis     — adds redis service for rate limiting
+#   (none)    — cadence + icecast + liquidsoap + SQLite
+#   postgres  — adds postgres, set CSERVER_DB_BACKEND=postgres in cadence.env
+#   redis     — adds redis for rate limiting
 #
-# Quick start (SQLite):
-#   docker compose up -d
-#
-# Full stack:
-#   docker compose --profile postgres --profile redis up -d
+# Required env vars (set in Portainer Stack → Environment variables):
+#   HOST_MUSIC_DIR   — absolute path on Docker host, e.g. /srv/data/music
 
 services:
 
   icecast2:
-    build:
-      context: .
-      dockerfile: ./src/icecast2.Dockerfile
-    image: cadence_icecast2
-    pull_policy: build
+    image: cadence_icecast2:latest
     container_name: icecast2
     restart: unless-stopped
     ports:
       - "8000:8000"
     volumes:
-      - ./config/icecast.xml:/etc/icecast/cadence.xml:ro
+      - /srv/ssd/HOMELAB/cadence/config/icecast.xml:/etc/icecast/cadence.xml:ro
     networks:
       - services-net
       - stream-net
@@ -36,16 +32,12 @@ services:
       start_period: 10s
 
   liquidsoap:
-    build:
-      context: .
-      dockerfile: ./src/liquidsoap.Dockerfile
-    image: cadence_liquidsoap
-    pull_policy: build
+    image: cadence_liquidsoap:latest
     container_name: liquidsoap
     restart: unless-stopped
     volumes:
-      - ./config/liquidsoap.liq:/etc/liquidsoap/cadence.liq:ro
-      - ${MUSIC_DIR:-/music}:${MUSIC_DIR:-/music}:ro
+      - /srv/ssd/HOMELAB/cadence/config/liquidsoap.liq:/etc/liquidsoap/cadence.liq:ro
+      - ${HOST_MUSIC_DIR}:/music:ro
     depends_on:
       icecast2:
         condition: service_healthy
@@ -57,21 +49,17 @@ services:
       - stream-net
 
   cadence:
-    build:
-      context: ./src/
-      dockerfile: ./cadence.Dockerfile
-    image: cadence
-    pull_policy: build
+    image: cadence:latest
     container_name: cadence
     restart: unless-stopped
     ports:
       - "8080:8080"
     env_file:
-      - ./config/cadence.env
+      - /srv/ssd/HOMELAB/cadence/config/cadence.env
     volumes:
-      - ${MUSIC_DIR:-/music}:${MUSIC_DIR:-/music}:ro
-      - ./src/server/public/css/custom.css:/app/public/css/custom.css:ro
-      - ./data:/data
+      - ${HOST_MUSIC_DIR}:/music:ro
+      - /srv/ssd/HOMELAB/cadence/custom.css:/app/public/css/custom.css:ro
+      - /srv/data/hdd_01/HOMELAB/cadence/data:/data
     depends_on:
       icecast2:
         condition: service_healthy
@@ -100,9 +88,9 @@ services:
     expose:
       - "5432"
     env_file:
-      - ./config/cadence.env
+      - /srv/ssd/HOMELAB/cadence/config/cadence.env
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - /srv/data/hdd_01/HOMELAB/cadence/postgres:/var/lib/postgresql/data
     networks:
       - services-net
     healthcheck:
@@ -142,6 +130,6 @@ services:
 
 networks:
   services-net:
-    driver: bridge
+    external: true
   stream-net:
     driver: bridge
