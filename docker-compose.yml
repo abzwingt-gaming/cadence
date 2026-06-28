@@ -18,6 +18,7 @@ services:
       context: .
       dockerfile: ./src/icecast2.Dockerfile
     image: cadence_icecast2
+    pull_policy: build
     container_name: icecast2
     restart: unless-stopped
     ports:
@@ -39,6 +40,7 @@ services:
       context: .
       dockerfile: ./src/liquidsoap.Dockerfile
     image: cadence_liquidsoap
+    pull_policy: build
     container_name: liquidsoap
     restart: unless-stopped
     volumes:
@@ -59,6 +61,7 @@ services:
       context: ./src/
       dockerfile: ./cadence.Dockerfile
     image: cadence
+    pull_policy: build
     container_name: cadence
     restart: unless-stopped
     ports:
@@ -113,9 +116,6 @@ services:
     image: redis:7-alpine
     container_name: cadence-redis
     restart: unless-stopped
-    # Only pass --requirepass when a password is actually set.
-    # Passing --requirepass "" in Redis 7 sets an empty-string password
-    # which is functionally different from no auth and breaks redis-cli ping.
     command: >
       sh -c '
         if [ -n "$${REDIS_PASSWORD}" ]; then
