@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -263,8 +265,6 @@ func sighupHandler() {
 }
 
 // loggingMiddleware logs every request at DEBUG level with the real client IP.
-// It delegates IP extraction to realIP() defined in db_redis.go, which handles
-// CIDR-aware proxy trust and X-Forwarded-For parsing correctly.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -294,7 +294,7 @@ func (sw *statusWriter) WriteHeader(code int) {
 	sw.ResponseWriter.WriteHeader(code)
 }
 
-// Flush proxies to the underlying ResponseWriter when it implements Flusher.
+// Flush proxies to the underlying ResponseWriter when it implements http.Flusher.
 // Required for SSE (EventSource) to push chunks without buffering.
 func (sw *statusWriter) Flush() {
 	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
@@ -302,16 +302,14 @@ func (sw *statusWriter) Flush() {
 	}
 }
 
-// Hijack proxies to the underlying ResponseWriter when it implements Hijacker.
-// Required for WebSocket upgrades that may go through this middleware.
-func (sw *statusWriter) Hijack() (interface{}, interface{}, error) {
-	type hijacker interface {
-		Hijack() (interface{}, interface{}, error)
-	}
-	if h, ok := sw.ResponseWriter.(hijacker); ok {
+// Hijack proxies to the underlying ResponseWriter when it implements http.Hijacker.
+// Returns the exact types required by the http.Hijacker interface so that
+// WebSocket upgrades pass through the middleware correctly.
+func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := sw.ResponseWriter.(http.Hijacker); ok {
 		return h.Hijack()
 	}
-	return nil, nil, fmt.Errorf("hijack not supported")
+	return nil, nil, fmt.Errorf("hijack not supported by underlying ResponseWriter")
 }
 
 func main() {

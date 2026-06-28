@@ -16,8 +16,10 @@ var dbs *sql.DB
 
 func sqliteInit() error {
 	var err error
-	// WAL mode + 5 s busy timeout + normal sync for best write throughput.
-	// foreign_keys=on for referential safety.
+	// WAL mode: supports multiple concurrent readers + one writer.
+	// busy_timeout=5000ms: readers/writers wait instead of returning SQLITE_BUSY.
+	// synchronous=NORMAL: safe under WAL (crash won't corrupt), faster than FULL.
+	// foreign_keys=on: referential integrity.
 	dsn := fmt.Sprintf(
 		"%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(on)",
 		c.SQLitePath,
@@ -28,10 +30,11 @@ func sqliteInit() error {
 		slog.Error("Cannot open SQLite.", "path", c.SQLitePath, "error", err)
 		return err
 	}
-	// SQLite supports only one writer at a time. Limiting the pool to a
-	// single connection eliminates SQLITE_BUSY races under concurrent
-	// scan + query load even when busy_timeout is set.
-	dbs.SetMaxOpenConns(1)
+	// WAL mode allows multiple concurrent readers — do not cap to 1.
+	// Write serialisation is handled by SQLite's internal locking +
+	// busy_timeout. Capping to 1 would serialise reads during scan, hurting
+	// search latency.
+	dbs.SetMaxOpenConns(0) // unlimited (Go default)
 	if err = dbs.Ping(); err != nil {
 		slog.Error("Cannot ping SQLite.", "path", c.SQLitePath, "error", err)
 		return err

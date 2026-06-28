@@ -35,7 +35,8 @@ var titleCleanupRe []*regexp.Regexp
 var artistCleanupRe []*regexp.Regexp
 
 // trackPrefixRe strips leading track numbers such as:
-//   "01 - ", "02. ", "003 ", "1) "
+//
+//	"01 - ", "02. ", "003 ", "1) "
 var trackPrefixRe = regexp.MustCompile(`^\d{1,4}[\s.\-)]*[-–]?\s*`)
 
 func resetCleanupRe() {
@@ -307,10 +308,10 @@ func dbPopulate() error {
 		scanned atomic.Int64
 		skipped atomic.Int64
 	)
-	for i, f := range files {
+	for _, f := range files {
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(path string, idx int) {
+		go func(path string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer func() {
@@ -341,8 +342,7 @@ func dbPopulate() error {
 					)
 				}
 			}
-			_ = idx
-		}(f, i)
+		}(f)
 	}
 	wg.Wait()
 	slog.Info("Scan complete.",
@@ -439,8 +439,8 @@ func extractRawYear(raw map[string]interface{}) string {
 		"DATE", "date",
 		"TDRC", "tdrc", // ID3v2.4 recording time
 		"TYER", "tyer", // ID3v2.3 year
-		"©day",         // MP4 / iTunes
-		"WM/Year",      // ASF / WMA
+		"©day",    // MP4 / iTunes
+		"WM/Year", // ASF / WMA
 	}
 	for _, k := range candidates {
 		v, ok := raw[k]
@@ -455,8 +455,7 @@ func extractRawYear(raw map[string]interface{}) string {
 		if len(s) >= 4 {
 			s = s[:4]
 		}
-		// Validate it's actually a number.
-		if _, err := fmt.Sscanf(s, "%*d"); err == nil || isAllDigits(s) {
+		if isAllDigits(s) {
 			return s
 		}
 	}

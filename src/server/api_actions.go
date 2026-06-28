@@ -25,17 +25,19 @@ var now = RadioInfo{}
 var nowMu sync.RWMutex
 
 // artCache stores base64-encoded album art keyed by song ID string.
-// Cleared on track change via artCacheClear().
+// Evicted on every track change via artCacheClear().
 var artCache sync.Map
 
+// artCacheClear evicts all cached album art when the track changes.
+// We do NOT reset artFlight here: any in-flight Do() calls for the
+// previous track will complete and store into artCache, but that entry
+// will simply be evicted on the next artCacheClear(). Resetting
+// artFlight while callers are inside Do() is a data race.
 func artCacheClear() {
 	artCache.Range(func(k, _ any) bool {
 		artCache.Delete(k)
 		return true
 	})
-	// Also forget any in-flight singleflight keys so the next request
-	// re-fetches art for the new track rather than returning stale data.
-	artFlight = singleflight.Group{}
 }
 
 type RadioInfo struct {
@@ -56,7 +58,7 @@ type SongData struct {
 	Path   string
 }
 
-var history   []playRecord
+var history []playRecord
 var historyMu sync.Mutex
 
 type playRecord struct {
