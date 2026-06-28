@@ -114,7 +114,6 @@ func cleanArtist(s string) string {
 // sanitize trims whitespace and control characters from s.
 // Returns fallback when s is empty after trimming.
 func sanitize(s, fallback string) string {
-	// Strip null bytes and other C0 control chars that ID3v1 tags can contain.
 	s = strings.Map(func(r rune) rune {
 		if r == 0 || (unicode.IsControl(r) && r != '\t' && r != '\n') {
 			return -1
@@ -150,14 +149,12 @@ func guessFromFilename(path string) (artist, title string) {
 	base = strings.ReplaceAll(base, "_-_", " - ")
 	base = strings.ReplaceAll(base, "_", " ")
 
-	// Strip track-number prefix before attempting to split.
 	stripped := trackPrefixRe.ReplaceAllString(base, "")
 
 	parts := strings.SplitN(stripped, " - ", 2)
 	if len(parts) == 2 {
 		left := strings.TrimSpace(parts[0])
 		right := strings.TrimSpace(parts[1])
-		// Only treat left as artist if it's not purely numeric.
 		if !isAllDigits(left) && left != "" {
 			return left, right
 		}
@@ -227,7 +224,6 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	return scanSongs(rows)
 }
 
-// getPathById fetches the file path for a song ID.
 func getPathById(id int) (string, error) {
 	var (
 		query string
@@ -352,13 +348,19 @@ func dbPopulate() error {
 	return nil
 }
 
-// extractTags reads ID3/Vorbis/MP4 tags from the audio file at path.
-// All error paths fall back gracefully; a panic in the tag library is
-// caught by the caller's recover() in dbPopulate.
+// extractTags resolves metadata for a single audio file.
+//
+// Priority (lowest → highest; each layer only fills empty slots):
+//
+//	1. filename guess        — always available, weakest signal
+//	2. yt-dlp sidecar       — enriches fields the embedded tags left blank
+//	3. embedded tags        — strongest signal; wins over sidecar when present
+//
+// The sidecar is intentionally loaded before opening the audio file so
+// that the tag-library parse (step 3) always has the last word.
 func extractTags(path string) (title, album, artist, genre, year string) {
+	// ── Step 1: filename guess ──────────────────────────────────────────────
 	guessArtist, guessTitle := guessFromFilename(path)
-	info := loadYTDLPInfo(path)
-
 	basenameFallback := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	title = sanitize(cleanTitle(guessTitle), basenameFallback)
 	artist = sanitize(cleanArtist(guessArtist), "Unknown Artist")
@@ -366,24 +368,28 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	genre = ""
 	year = ""
 
-	if info != nil {
-		if infoTitle := sanitize(cleanTitle(info.BestTitle()), ""); infoTitle != "" {
-			title = infoTitle
+	// ── Step 2: yt-dlp sidecar ──────────────────────────────────────────────
+	// Only fills fields that are still at their default values.
+	// Embedded tags (step 3) will override anything set here.
+	if info := loadYTDLPInfo(path); info != nil {
+		if s := sanitize(cleanTitle(info.BestTitle()), ""); s != "" {
+			title = s
 		}
-		if infoArtist := sanitize(cleanArtist(info.BestArtist()), ""); infoArtist != "" {
-			artist = infoArtist
+		if s := sanitize(cleanArtist(info.BestArtist()), ""); s != "" {
+			artist = s
 		}
-		if infoAlbum := sanitize(info.Album, ""); infoAlbum != "" {
-			album = infoAlbum
+		if s := sanitize(info.BestAlbum(), ""); s != "" {
+			album = s
 		}
-		if infoGenre := sanitize(info.Genre, ""); infoGenre != "" {
-			genre = infoGenre
+		if s := sanitize(info.Genre, ""); s != "" {
+			genre = s
 		}
-		if infoYear := sanitize(info.ReleaseYear(), ""); infoYear != "" {
-			year = infoYear
+		if s := info.BestYear(); s != "" {
+			year = s
 		}
 	}
 
+	// ── Step 3: embedded tags ───────────────────────────────────────────────
 	f, err := os.Open(path)
 	if err != nil {
 		slog.Warn("Cannot open file for tag read.", "path", path, "error", err)
@@ -393,60 +399,74 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		slog.Debug("No tags found, using filename/info fallback.", "path", path, "reason", err)
+		// No embedded tags — filename + sidecar values stand.
+		slog.Debug("No embedded tags; using filename/sidecar values.",
+			"path", path, "reason", err)
 		return
 	}
 
-	if rawTitle := sanitize(tags.Title(), ""); rawTitle != "" {
-		cleaned := cleanTitle(rawTitle)
-		title = sanitize(cleaned, rawTitle)
+	// Title: embedded tag beats everything.
+	if raw := sanitize(tags.Title(), ""); raw != "" {
+		cleaned := cleanTitle(raw)
+		// Guard: if cleanup strips the whole title (e.g. tag is just
+		// "(Official Video)"), keep the original uncleaned value.
+		title = sanitize(cleaned, raw)
 	}
 
-	if rawArtist := sanitize(tags.Artist(), ""); rawArtist != "" {
-		cleaned := cleanArtist(rawArtist)
-		artist = sanitize(cleaned, rawArtist)
-	} else if raw := tags.Raw(); raw != nil {
-		if uploader := sanitize(cleanArtist(rawString(raw, "uploader", "UPLOADER", "album_artist", "ALBUM_ARTIST")), ""); uploader != "" {
-			artist = uploader
-		} else if info != nil {
-			artist = sanitize(cleanArtist(info.BestArtist()), artist)
+	// Artist: embedded tag > non-standard raw frames > sidecar > filename.
+	// We only check raw frames when the standard accessor returns empty,
+	// because yt-dlp sometimes writes uploader into non-standard Vorbis tags.
+	if raw := sanitize(tags.Artist(), ""); raw != "" {
+		cleaned := cleanArtist(raw)
+		artist = sanitize(cleaned, raw)
+	} else if rawMap := tags.Raw(); rawMap != nil {
+		// Non-standard frames that yt-dlp embeds when the video has a
+		// proper artist tag in a non-standard slot.
+		if s := sanitize(cleanArtist(rawTagString(rawMap,
+			"ARTIST", "artist",             // Vorbis standard (already tried above via tags.Artist)
+			"album_artist", "ALBUM_ARTIST", // fallback: album artist
+			"TPE2",                          // ID3v2 album artist
+		)), ""); s != "" {
+			artist = s
 		}
-	} else if info != nil {
-		artist = sanitize(cleanArtist(info.BestArtist()), artist)
-	} else if guessArtist != "" {
-		cleaned := cleanArtist(guessArtist)
-		artist = sanitize(cleaned, guessArtist)
-		slog.Debug("Artist tag empty, using filename guess.", "path", path, "artist", artist)
+		// Sidecar uploader/channel is already in `artist` from step 2;
+		// only overwrite if we found something better in raw frames.
 	}
 
-	if rawAlbum := sanitize(tags.Album(), ""); rawAlbum != "" {
-		album = rawAlbum
-	} else if info != nil {
-		album = sanitize(info.Album, album)
+	// Album: embedded tag beats sidecar (playlist name).
+	if raw := sanitize(tags.Album(), ""); raw != "" {
+		album = raw
 	}
 
-	genre = sanitize(tags.Genre(), genre)
+	// Genre: embedded tag beats sidecar.
+	if raw := sanitize(tags.Genre(), ""); raw != "" {
+		genre = raw
+	}
 
+	// Year: prefer embedded numeric year; fall through raw map; sidecar last.
 	if y := tags.Year(); y > 0 {
 		year = fmt.Sprintf("%d", y)
-	} else if raw := tags.Raw(); raw != nil {
-		year = sanitize(extractRawYear(raw), year)
+	} else if rawMap := tags.Raw(); rawMap != nil {
+		if s := extractRawYear(rawMap); s != "" {
+			year = s
+		}
 	}
-	if info != nil {
-		year = sanitize(info.ReleaseYear(), year)
-	}
+	// Sidecar year fills the gap only if nothing embedded was found.
+	// (already set in step 2; leave it unless the embedded tag had something)
 
 	return
 }
 
+// extractRawYear looks for common year tag keys in the raw tag map.
+// Handles Vorbis (YEAR / DATE), ID3v2 (TDRC / TYER), MP4 (©day), ASF (WM/Year).
 func extractRawYear(raw map[string]interface{}) string {
 	candidates := []string{
 		"YEAR", "year",
 		"DATE", "date",
-		"TDRC", "tdrc",
-		"TYER", "tyer",
-		"©day",
-		"WM/Year",
+		"TDRC", "tdrc", // ID3v2.4 recording time
+		"TYER", "tyer", // ID3v2.3 year
+		"©day",    // MP4 / iTunes
+		"WM/Year", // ASF / WMA
 	}
 	for _, k := range candidates {
 		v, ok := raw[k]
