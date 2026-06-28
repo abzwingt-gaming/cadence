@@ -60,12 +60,12 @@ func ensureCleanupRe() {
 	if titleCleanupRe != nil {
 		return
 	}
-	sep := c.PatternSeparator
+	sep := c().PatternSeparator
 	if sep == "" {
 		sep = ";;"
 	}
-	titleCleanupRe = compilePatterns(c.TitleCleanupPatterns, sep)
-	artistCleanupRe = compilePatterns(c.ArtistCleanupPatterns, sep)
+	titleCleanupRe = compilePatterns(c().TitleCleanupPatterns, sep)
+	artistCleanupRe = compilePatterns(c().ArtistCleanupPatterns, sep)
 	slog.Info("Cleanup patterns compiled.",
 		"title_patterns", len(titleCleanupRe),
 		"artist_patterns", len(artistCleanupRe),
@@ -114,7 +114,6 @@ func cleanArtist(s string) string {
 // sanitize trims whitespace and control characters from s.
 // Returns fallback when s is empty after trimming.
 func sanitize(s, fallback string) string {
-	// Strip null bytes and other C0 control chars that ID3v1 tags can contain.
 	s = strings.Map(func(r rune) rune {
 		if r == 0 || (unicode.IsControl(r) && r != '\t' && r != '\n') {
 			return -1
@@ -150,14 +149,12 @@ func guessFromFilename(path string) (artist, title string) {
 	base = strings.ReplaceAll(base, "_-_", " - ")
 	base = strings.ReplaceAll(base, "_", " ")
 
-	// Strip track-number prefix before attempting to split.
 	stripped := trackPrefixRe.ReplaceAllString(base, "")
 
 	parts := strings.SplitN(stripped, " - ", 2)
 	if len(parts) == 2 {
 		left := strings.TrimSpace(parts[0])
 		right := strings.TrimSpace(parts[1])
-		// Only treat left as artist if it's not purely numeric.
 		if !isAllDigits(left) && left != "" {
 			return left, right
 		}
@@ -183,8 +180,8 @@ func searchByQuery(query string) ([]SongData, error) {
 	if query == "" {
 		return nil, fmt.Errorf("empty search query")
 	}
-	slog.Debug("searchByQuery.", "query", query, "backend", c.DBBackend)
-	if c.DBBackend == "sqlite" {
+	slog.Debug("searchByQuery.", "query", query, "backend", c().DBBackend)
+	if c().DBBackend == "sqlite" {
 		return sqliteSearchByQuery(query)
 	}
 	sel := fmt.Sprintf(
@@ -194,7 +191,7 @@ func searchByQuery(query string) ([]SongData, error) {
 		   levenshtein(lower($3), lower(artist)),
 		   levenshtein(lower($4), lower(title))
 		 ) LIMIT 200`,
-		c.PostgresTableName)
+		c().PostgresTableName)
 	rows, err := dbp.Query(sel, "%"+query+"%", "%"+query+"%", query, query)
 	if err != nil {
 		slog.Error("searchByQuery failed.", "query", query, "error", err)
@@ -211,13 +208,13 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 		return nil, fmt.Errorf("empty title in searchByTitleArtist")
 	}
 	slog.Debug("searchByTitleArtist.", "title", title, "artist", artist)
-	if c.DBBackend == "sqlite" {
+	if c().DBBackend == "sqlite" {
 		return sqliteSearchByTitleArtist(title, artist)
 	}
 	sel := fmt.Sprintf(
 		`SELECT id, artist, title, album, genre, year FROM %s
 		 WHERE title ILIKE $1 AND artist ILIKE $2 LIMIT 5`,
-		c.PostgresTableName)
+		c().PostgresTableName)
 	rows, err := dbp.Query(sel, "%"+title+"%", "%"+artist+"%")
 	if err != nil {
 		slog.Error("searchByTitleArtist failed.", "title", title, "artist", artist, "error", err)
@@ -227,16 +224,15 @@ func searchByTitleArtist(title, artist string) ([]SongData, error) {
 	return scanSongs(rows)
 }
 
-// getPathById fetches the file path for a song ID.
 func getPathById(id int) (string, error) {
 	var (
 		query string
 		arg   interface{} = id
 	)
-	if c.DBBackend == "sqlite" {
+	if c().DBBackend == "sqlite" {
 		query = `SELECT path FROM metadata WHERE id=?`
 	} else {
-		query = fmt.Sprintf(`SELECT path FROM %s WHERE id=$1`, c.PostgresTableName)
+		query = fmt.Sprintf(`SELECT path FROM %s WHERE id=$1`, c().PostgresTableName)
 	}
 	var path string
 	err := dbActive.QueryRow(query, arg).Scan(&path)
@@ -270,18 +266,18 @@ func scanSongs(rows *sql.Rows) ([]SongData, error) {
 func dbPopulate() error {
 	ensureCleanupRe()
 
-	if c.MusicDir == "" {
+	if c().MusicDir == "" {
 		slog.Warn("CSERVER_MUSIC_DIR not set, skipping populate.")
 		return nil
 	}
-	if _, err := os.Stat(c.MusicDir); err != nil {
-		slog.Error("Music dir not accessible.", "dir", c.MusicDir, "error", err)
-		return fmt.Errorf("music dir %q not accessible: %w", c.MusicDir, err)
+	if _, err := os.Stat(c().MusicDir); err != nil {
+		slog.Error("Music dir not accessible.", "dir", c().MusicDir, "error", err)
+		return fmt.Errorf("music dir %q not accessible: %w", c().MusicDir, err)
 	}
 
-	slog.Info("Walking music directory.", "dir", c.MusicDir)
+	slog.Info("Walking music directory.", "dir", c().MusicDir)
 	var files []string
-	err := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(c().MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			slog.Warn("Walk error, skipping path.", "path", path, "error", err)
 			return nil
@@ -296,7 +292,7 @@ func dbPopulate() error {
 	}
 
 	total := len(files)
-	workers := c.ScanWorkers
+	workers := c().ScanWorkers
 	if workers <= 0 {
 		workers = runtime.NumCPU()
 	}
@@ -324,7 +320,7 @@ func dbPopulate() error {
 
 			title, album, artist, genre, year := extractTags(path)
 			var upsertErr error
-			if c.DBBackend == "sqlite" {
+			if c().DBBackend == "sqlite" {
 				upsertErr = sqliteUpsert(title, album, artist, genre, year, path)
 			} else {
 				upsertErr = postgresUpsert(title, album, artist, genre, year, path)
@@ -333,7 +329,6 @@ func dbPopulate() error {
 				skipped.Add(1)
 			} else {
 				n := scanned.Add(1)
-				// Progress log every 500 files.
 				if n%500 == 0 {
 					slog.Info("Scan progress.",
 						"scanned", n,
@@ -353,15 +348,19 @@ func dbPopulate() error {
 	return nil
 }
 
-// extractTags reads ID3/Vorbis/MP4 tags from the audio file at path.
-// All error paths fall back gracefully; a panic in the tag library is
-// caught by the caller's recover() in dbPopulate.
+// extractTags resolves metadata for a single audio file.
+//
+// Priority (lowest → highest; each layer only fills empty slots):
+//
+//	1. filename guess        — always available, weakest signal
+//	2. yt-dlp sidecar       — enriches fields the embedded tags left blank
+//	3. embedded tags        — strongest signal; wins over sidecar when present
+//
+// The sidecar is intentionally loaded before opening the audio file so
+// that the tag-library parse (step 3) always has the last word.
 func extractTags(path string) (title, album, artist, genre, year string) {
-	// --- Step 1: filename-based defaults (always present) ---
+	// ── Step 1: filename guess ──────────────────────────────────────────────
 	guessArtist, guessTitle := guessFromFilename(path)
-
-	// Apply cleanup regexes to guessed values; fall back to the raw basename
-	// so we never store an empty title.
 	basenameFallback := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	title = sanitize(cleanTitle(guessTitle), basenameFallback)
 	artist = sanitize(cleanArtist(guessArtist), "Unknown Artist")
@@ -369,7 +368,28 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	genre = ""
 	year = ""
 
-	// --- Step 2: open file ---
+	// ── Step 2: yt-dlp sidecar ──────────────────────────────────────────────
+	// Only fills fields that are still at their default values.
+	// Embedded tags (step 3) will override anything set here.
+	if info := loadYTDLPInfo(path); info != nil {
+		if s := sanitize(cleanTitle(info.BestTitle()), ""); s != "" {
+			title = s
+		}
+		if s := sanitize(cleanArtist(info.BestArtist()), ""); s != "" {
+			artist = s
+		}
+		if s := sanitize(info.BestAlbum(), ""); s != "" {
+			album = s
+		}
+		if s := sanitize(info.Genre, ""); s != "" {
+			genre = s
+		}
+		if s := info.BestYear(); s != "" {
+			year = s
+		}
+	}
+
+	// ── Step 3: embedded tags ───────────────────────────────────────────────
 	f, err := os.Open(path)
 	if err != nil {
 		slog.Warn("Cannot open file for tag read.", "path", path, "error", err)
@@ -377,62 +397,68 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	}
 	defer f.Close()
 
-	// --- Step 3: parse tags ---
 	tags, err := tag.ReadFrom(f)
 	if err != nil {
-		// Not an error — many valid audio files have no embedded tags.
-		slog.Debug("No tags found, using filename fallback.", "path", path, "reason", err)
+		// No embedded tags — filename + sidecar values stand.
+		slog.Debug("No embedded tags; using filename/sidecar values.",
+			"path", path, "reason", err)
 		return
 	}
 
-	// --- Step 4: Title ---
-	// Priority: tag > cleaned tag (if not empty after cleanup) > filename guess.
-	if rawTitle := sanitize(tags.Title(), ""); rawTitle != "" {
-		cleaned := cleanTitle(rawTitle)
-		// If cleanup stripped everything (e.g. title is purely "(Official Video)"),
-		// keep the original uncleaned tag value so the title is never empty.
-		title = sanitize(cleaned, rawTitle)
+	// Title: embedded tag beats everything.
+	if raw := sanitize(tags.Title(), ""); raw != "" {
+		cleaned := cleanTitle(raw)
+		// Guard: if cleanup strips the whole title (e.g. tag is just
+		// "(Official Video)"), keep the original uncleaned value.
+		title = sanitize(cleaned, raw)
 	}
 
-	// --- Step 5: Artist ---
-	// Priority: tag > cleaned tag (non-empty after cleanup) > filename guess > "Unknown Artist".
-	if rawArtist := sanitize(tags.Artist(), ""); rawArtist != "" {
-		cleaned := cleanArtist(rawArtist)
-		// Guard: if cleanup produced an empty string, fall back to the raw tag.
-		artist = sanitize(cleaned, rawArtist)
-	} else if guessArtist != "" {
-		cleaned := cleanArtist(guessArtist)
-		artist = sanitize(cleaned, guessArtist)
-		slog.Debug("Artist tag empty, using filename guess.", "path", path, "artist", artist)
+	// Artist: embedded tag > non-standard raw frames > sidecar > filename.
+	// We only check raw frames when the standard accessor returns empty,
+	// because yt-dlp sometimes writes uploader into non-standard Vorbis tags.
+	if raw := sanitize(tags.Artist(), ""); raw != "" {
+		cleaned := cleanArtist(raw)
+		artist = sanitize(cleaned, raw)
+	} else if rawMap := tags.Raw(); rawMap != nil {
+		// Non-standard frames that yt-dlp embeds when the video has a
+		// proper artist tag in a non-standard slot.
+		if s := sanitize(cleanArtist(rawTagString(rawMap,
+			"ARTIST", "artist",             // Vorbis standard (already tried above via tags.Artist)
+			"album_artist", "ALBUM_ARTIST", // fallback: album artist
+			"TPE2",                          // ID3v2 album artist
+		)), ""); s != "" {
+			artist = s
+		}
+		// Sidecar uploader/channel is already in `artist` from step 2;
+		// only overwrite if we found something better in raw frames.
 	}
-	// artist was already initialised to "Unknown Artist" from step 1,
-	// so if both tag and guess are empty it stays as the fallback.
 
-	// --- Step 6: Album ---
-	if rawAlbum := sanitize(tags.Album(), ""); rawAlbum != "" {
-		album = rawAlbum
+	// Album: embedded tag beats sidecar (playlist name).
+	if raw := sanitize(tags.Album(), ""); raw != "" {
+		album = raw
 	}
 
-	// --- Step 7: Genre ---
-	// sanitize strips null bytes that ID3v1 genre fields often contain.
-	genre = sanitize(tags.Genre(), "")
+	// Genre: embedded tag beats sidecar.
+	if raw := sanitize(tags.Genre(), ""); raw != "" {
+		genre = raw
+	}
 
-	// --- Step 8: Year ---
-	// tag.Year() returns 0 for formats that store year as a string tag
-	// (Vorbis YEAR, MP4 ©day, etc.). Try the numeric field first, then
-	// fall back to the raw string via tag.Raw().
+	// Year: prefer embedded numeric year; fall through raw map; sidecar last.
 	if y := tags.Year(); y > 0 {
 		year = fmt.Sprintf("%d", y)
-	} else if raw := tags.Raw(); raw != nil {
-		year = extractRawYear(raw)
+	} else if rawMap := tags.Raw(); rawMap != nil {
+		if s := extractRawYear(rawMap); s != "" {
+			year = s
+		}
 	}
+	// Sidecar year fills the gap only if nothing embedded was found.
+	// (already set in step 2; leave it unless the embedded tag had something)
 
 	return
 }
 
-// extractRawYear looks for common year tag keys in the raw tag map returned
-// by tag.Metadata.Raw(). Handles Vorbis (YEAR / DATE), ID3v2 (TDRC / TYER),
-// MP4 (©day), and ASF (WM/Year).
+// extractRawYear looks for common year tag keys in the raw tag map.
+// Handles Vorbis (YEAR / DATE), ID3v2 (TDRC / TYER), MP4 (©day), ASF (WM/Year).
 func extractRawYear(raw map[string]interface{}) string {
 	candidates := []string{
 		"YEAR", "year",
@@ -451,7 +477,6 @@ func extractRawYear(raw map[string]interface{}) string {
 		if s == "" || s == "0" || s == "<nil>" {
 			continue
 		}
-		// Use only the 4-digit year portion (e.g. "2023-04-01" → "2023").
 		if len(s) >= 4 {
 			s = s[:4]
 		}
