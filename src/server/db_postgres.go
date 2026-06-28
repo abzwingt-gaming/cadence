@@ -15,16 +15,15 @@ import (
 var dbp *sql.DB
 
 func postgresInit() error {
-	// Use URL-encoded DSN to safely handle passwords containing special
-	// characters (quotes, spaces, @, etc.) that would break key=value syntax.
+	conf := c()
 	u := &url.URL{
 		Scheme: "postgres",
-		User:   url.UserPassword(c.PostgresUser, c.PostgresPassword),
-		Host:   fmt.Sprintf("%s:%s", c.PostgresAddress, c.PostgresPort),
-		Path:   "/" + c.PostgresDBName,
+		User:   url.UserPassword(conf.PostgresUser, conf.PostgresPassword),
+		Host:   fmt.Sprintf("%s:%s", conf.PostgresAddress, conf.PostgresPort),
+		Path:   "/" + conf.PostgresDBName,
 	}
 	q := u.Query()
-	q.Set("sslmode", c.PostgresSSL)
+	q.Set("sslmode", conf.PostgresSSL)
 	u.RawQuery = q.Encode()
 	dsn := u.String()
 
@@ -39,8 +38,6 @@ func postgresInit() error {
 		return err
 	}
 
-	// Enable fuzzystrmatch for levenshtein search. Failure is non-fatal;
-	// search degrades to ILIKE only.
 	if _, err = dbp.Exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch"); err != nil {
 		slog.Warn("fuzzystrmatch enable failed; fuzzy search degraded.", "error", err)
 	}
@@ -54,12 +51,12 @@ func postgresInit() error {
 			genre  VARCHAR(255),
 			year   VARCHAR(4),
 			path   VARCHAR(510) UNIQUE
-		)`, c.PostgresTableName)
+		)`, conf.PostgresTableName)
 	if _, err = dbp.Exec(createTable); err != nil {
 		slog.Error("Failed to create metadata table.", "error", err)
 		return err
 	}
-	slog.Info("Postgres ready.", "table", c.PostgresTableName)
+	slog.Info("Postgres ready.", "table", conf.PostgresTableName)
 	dbActive = dbp
 	return nil
 }
@@ -70,7 +67,7 @@ func postgresUpsert(title, album, artist, genre, year, path string) error {
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (path) DO UPDATE
 		  SET title=$1, album=$2, artist=$3, genre=$4, year=$5`,
-		c.PostgresTableName)
+		c().PostgresTableName)
 	_, err := dbp.Exec(upsert, title, album, artist, genre, year, path)
 	return err
 }

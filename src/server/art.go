@@ -27,9 +27,6 @@ func inMemoryArtCacheClear() {
 	artMu.Unlock()
 }
 
-// artCacheClear is an alias kept for call-sites in api_actions.go.
-func artCacheClear() { inMemoryArtCacheClear() }
-
 // albumArtForTrack looks up the current track in the DB, reads embedded
 // art from the audio file, and falls back to cover.jpg/png in the same dir.
 func albumArtForTrack(title, artist string) ([]byte, string, error) {
@@ -53,7 +50,6 @@ func albumArtForTrack(title, artist string) ([]byte, string, error) {
 
 	data, mime, err := readEmbeddedArt(path)
 	if err != nil {
-		// Fall back to cover image in the same directory.
 		data, mime, err = readFileArt(ArtworkPath(path))
 		if err != nil {
 			return nil, "", fmt.Errorf("no art found for %q", path)
