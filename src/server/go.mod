@@ -6,7 +6,6 @@ require (
 	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/lib/pq v1.10.9
 	github.com/redis/go-redis/v9 v9.5.1
-	gopkg.in/antage/eventsource.v1 v1.0.0-20150318155416-803f4c5af225
 	modernc.org/sqlite v1.29.9
 )
 
