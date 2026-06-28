@@ -1,424 +1,237 @@
-// api.go - HTTP handlers.
+// api.go — HTTP handlers and routing.
 
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"net/http"
-	"os"
-	"strconv"
 	"strings"
-	"sync/atomic"
-	"time"
-
-	"github.com/dhowden/tag"
-	"golang.org/x/sync/singleflight"
 )
 
-// rescanRunning prevents overlapping rescans triggered by /api/admin/rescan,
-// SIGHUP, or the filesystem watcher.
-var rescanRunning atomic.Bool
+// ── realIP ────────────────────────────────────────────────────────────────────
+// Extracts the real client IP using the trusted proxy config.
+// Used by the built-in rate limiter (CSERVER_RATELIMIT_ENABLED=true) and logging.
+//
+// IMPORTANT: when running behind Caddy with RatelimitEnabled=false (default),
+// RemoteAddr is always Caddy's IP. The Caddy rate_limit directive sees real
+// client IPs before forwarding — use that for per-client limits in production.
 
-// artFlight deduplicates concurrent in-flight album-art requests for the
-// same song ID, preventing multiple goroutines opening and reading the same
-// audio file simultaneously.
-var artFlight singleflight.Group
-
-// dbPingCache avoids a real DB round-trip on every health-check request.
-// Refreshed by background goroutine every 10 s.
-var dbPingOK atomic.Bool
-
-func init() {
-	go func() {
-		for {
-			time.Sleep(10 * time.Second)
-			if dbActive != nil {
-				dbPingOK.Store(dbActive.Ping() == nil)
-			}
-		}
-	}()
-}
-
-// maxBodyBytes is the maximum request body size accepted by JSON handlers.
-// Guards against accidental or malicious oversized POST bodies.
-const maxBodyBytes = 512 * 1024 // 512 KB
-
-// streamIdle reports whether the icecast monitor has set sentinel "idle" values.
-func streamIdle(title, artist string) bool {
-	return title == "" || title == "-" || artist == "-"
-}
-
-// buildPublicStream constructs the public stream URL from host+mountpoint,
-// trimming slashes to prevent double-slash when host ends with "/" or
-// mountpoint starts with "/". Used by both ListenURL() and icecastMonitor().
-func buildPublicStream(host, mountpoint string) string {
-	if c.PublicStreamURL != "" {
-		return c.PublicStreamURL
+func realIP(r *http.Request) (string, error) {
+	conf := c()
+	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if conf.RealIPHeader == "" {
+		return remoteIP, nil
 	}
-	return strings.TrimRight(host, "/") + "/" + strings.TrimLeft(mountpoint, "/")
+
+	if conf.TrustedProxy != "" {
+		_, trustedNet, err := net.ParseCIDR(conf.TrustedProxy)
+		if err != nil {
+			if remoteIP != conf.TrustedProxy {
+				return remoteIP, nil
+			}
+		} else if !trustedNet.Contains(net.ParseIP(remoteIP)) {
+			return remoteIP, nil
+		}
+	}
+
+	if val := r.Header.Get(conf.RealIPHeader); val != "" {
+		if idx := strings.Index(val, ","); idx != -1 {
+			val = strings.TrimSpace(val[:idx])
+		}
+		return val, nil
+	}
+	return remoteIP, nil
 }
 
-// writeJSON encodes v as JSON into w, setting Content-Type and logging any
-// encode error.
-func writeJSON(w http.ResponseWriter, v any) {
+// ── writeJSON ─────────────────────────────────────────────────────────────────
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Warn("JSON encode error.", "error", err)
 	}
 }
 
-// decodeJSONBody decodes the request body into dst with a size limit.
-// Returns false and writes the appropriate error response on failure.
-func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		var maxErr *http.MaxBytesError
-		if err.Error() == "http: request body too large" || isMaxBytesError(err, &maxErr) {
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-		} else {
-			w.WriteHeader(http.StatusBadRequest)
-		}
-		return false
+// ── Health ────────────────────────────────────────────────────────────────────
+// /livez — instant liveness. Caddy health_uri should point here.
+// /readyz — readiness. Returns 503 until DB is populated after startup.
+
+var dbReady atomic.Bool
+
+func handleLivez(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": c().Version})
+}
+
+func handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if !dbReady.Load() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "db not ready"})
+		return
 	}
-	return true
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// isMaxBytesError checks whether err is from http.MaxBytesReader.
-func isMaxBytesError(err error, _ **http.MaxBytesError) bool {
-	return strings.Contains(err.Error(), "request body too large")
+// ── Now playing ───────────────────────────────────────────────────────────────
+
+func handleNowPlaying(w http.ResponseWriter, r *http.Request) {
+	nd := getNowPlaying()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Title":      nd.Title,
+		"Artist":     nd.Artist,
+		"Mountpoint": nd.Mountpoint,
+	})
 }
 
-func Search() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Query string `json:"search"`
-		}
-		if !decodeJSONBody(w, r, &req) {
-			return
-		}
-		// Reject empty queries explicitly — searchByQuery returns an error
-		// for empty strings, which would otherwise become a 500.
-		if strings.TrimSpace(req.Query) == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		results, err := searchByQuery(req.Query)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		// Always return an array, never JSON null.
-		if results == nil {
-			results = []SongData{}
-		}
-		writeJSON(w, results)
+func handleListeners(w http.ResponseWriter, r *http.Request) {
+	nd := getNowPlaying()
+	writeJSON(w, http.StatusOK, map[string]int{"Listeners": nd.Listeners})
+}
+
+func handleBitrate(w http.ResponseWriter, r *http.Request) {
+	nd := getNowPlaying()
+	// Available=false means Icecast is unreachable or stream is down, not "0 kbps".
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Bitrate":   nd.Bitrate,
+		"Available": nd.Bitrate > 0,
+	})
+}
+
+// handleStatus is a merged endpoint returning all radio status in one request.
+// Prefer this over polling /listeners and /bitrate separately.
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	nd := getNowPlaying()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"Title":     nd.Title,
+		"Artist":    nd.Artist,
+		"Stream":    nd.Mountpoint,
+		"Listeners": nd.Listeners,
+		"Bitrate":   nd.Bitrate,
+	})
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, historyGet())
+}
+
+// ── Song request ──────────────────────────────────────────────────────────────
+
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-}
-
-func RequestID() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ ID string }
-		if !decodeJSONBody(w, r, &req) {
-			return
-		}
-		id, err := strconv.Atoi(req.ID)
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		path, err := getPathById(id)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if _, err = liquidsoapRequest(path); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
+	if rateLimitRequest(w, r) {
+		return
 	}
-}
-
-func RequestBestMatch() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		var req struct{ Search string }
-		if !decodeJSONBody(w, r, &req) {
-			return
-		}
-		if strings.TrimSpace(req.Search) == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		results, err := searchByQuery(req.Search)
-		if err != nil || len(results) == 0 {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		path, err := getPathById(results[0].ID)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		if _, err = liquidsoapRequest(path); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
+	var body struct {
+		ID string `json:"id"`
 	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.ID == "" {
+		http.Error(w, "invalid request body: 'id' required", http.StatusBadRequest)
+		return
+	}
+	if err := requestSong(body.ID); err != nil {
+		slog.Error("Song request to Liquidsoap failed.", "id", body.ID, "error", err)
+		http.Error(w, "failed to queue song", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "queued"})
 }
 
-func NowPlayingMetadata() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		if streamIdle(n.Song.Title, n.Song.Artist) {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if len(results) == 0 {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		writeJSON(w, results[0])
+// ── Album art ─────────────────────────────────────────────────────────────────
+
+func handleAlbumArt(w http.ResponseWriter, r *http.Request) {
+	if rateLimitArt(w, r) {
+		return
+	}
+	nd := getNowPlaying()
+	data, mime, err := albumArtForTrack(nd.Title, nd.Artist)
+	if err != nil {
+		http.Error(w, "art not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", mime)
+	w.Header().Set("Cache-Control", "public, max-age=60")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+	if _, err := w.Write(data); err != nil {
+		slog.Debug("Album art write error (client likely disconnected).", "error", err)
 	}
 }
 
-func NowPlayingAlbumArt() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		if streamIdle(n.Song.Title, n.Song.Artist) {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		results, err := searchByTitleArtist(n.Song.Title, n.Song.Artist)
-		if err != nil || len(results) == 0 {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		song := results[0]
-		cacheKey := fmt.Sprintf("%d", song.ID)
+// ── Search ────────────────────────────────────────────────────────────────────
 
-		// Fast path: cache hit.
-		if cached, ok := artCache.Load(cacheKey); ok {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(cached.([]byte))
-			return
-		}
-
-		// Slow path: deduplicate concurrent requests for the same song via
-		// singleflight. Only one goroutine opens the file; others wait and
-		// share the result.
-		v, err, _ := artFlight.Do(cacheKey, func() (interface{}, error) {
-			// Double-check cache after acquiring the flight slot.
-			if cached, ok := artCache.Load(cacheKey); ok {
-				return cached.([]byte), nil
-			}
-
-			path, pathErr := getPathById(song.ID)
-			if pathErr != nil {
-				return nil, pathErr
-			}
-
-			var encoded string
-
-			// 1. Embedded tag art.
-			func() {
-				f, ferr := os.Open(path)
-				if ferr != nil {
-					return
-				}
-				defer f.Close()
-				// Limit tag read to 64 MB to avoid unbounded memory on corrupt files.
-				tags, terr := tag.ReadFrom(io.LimitReader(f, 64*1024*1024))
-				if terr == nil && tags.Picture() != nil {
-					encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
-				}
-			}()
-
-			// 2. Fallback: cover.jpg / folder.jpg in the same directory.
-			if encoded == "" {
-				if fallbackPath := ArtworkPath(path); fallbackPath != "" {
-					if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
-						encoded = base64.StdEncoding.EncodeToString(data)
-						slog.Debug("Artwork from fallback file.", "path", fallbackPath)
-					}
-				}
-			}
-
-			if encoded == "" {
-				return nil, nil // signals 204 No Content
-			}
-
-			type ArtResponse struct {
-				Picture string `json:"Picture"`
-			}
-			jsonBytes, merr := json.Marshal(ArtResponse{Picture: encoded})
-			if merr != nil {
-				return nil, merr
-			}
-			artCache.Store(cacheKey, jsonBytes)
-			return jsonBytes, nil
-		})
-
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		if v == nil {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(v.([]byte))
+func handleSearch(w http.ResponseWriter, r *http.Request) {
+	q := strings.TrimSpace(r.URL.Query().Get("q"))
+	if len([]rune(q)) < 2 {
+		writeJSON(w, http.StatusOK, []any{})
+		return
 	}
+	results, err := dbSearch(q)
+	if err != nil {
+		slog.Warn("Search error.", "q", q, "error", err)
+		http.Error(w, "search failed", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, results)
 }
 
-func History() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		historyMu.Lock()
-		snap := make([]playRecord, len(history))
-		copy(snap, history)
-		historyMu.Unlock()
-		if snap == nil {
-			snap = []playRecord{}
-		}
-		writeJSON(w, snap)
+// ── Admin / dev ───────────────────────────────────────────────────────────────
+
+func handleAdminRescan(w http.ResponseWriter, r *http.Request) {
+	if sighupReloading.Load() {
+		http.Error(w, "scan already in progress", http.StatusConflict)
+		return
 	}
+	sighupReloading.Store(true)
+	go func() {
+		defer sighupReloading.Store(false)
+		if err := dbPopulate(); err != nil {
+			slog.Error("Admin rescan failed.", "error", err)
+		}
+	}()
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "scan started"})
 }
 
-func ListenURL() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		publicURL := buildPublicStream(n.Host, n.Mountpoint)
-		writeJSON(w, struct{ ListenURL string }{ListenURL: publicURL})
+func handleDevSkip(w http.ResponseWriter, r *http.Request) {
+	if !c().DevMode {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
 	}
+	if err := requestSong("skip"); err != nil {
+		http.Error(w, "skip failed", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "skipped"})
 }
 
-func Listeners() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		listeners := n.Listeners
-		if listeners < 0 {
-			listeners = 0
-		}
-		writeJSON(w, struct{ Listeners int64 }{Listeners: listeners})
-	}
-}
+// ── Routes ────────────────────────────────────────────────────────────────────
 
-func Bitrate() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		writeJSON(w, struct{ Bitrate float64 }{Bitrate: n.Bitrate})
-	}
-}
+func routes() http.Handler {
+	mux := http.NewServeMux()
 
-func Version() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, struct{ Version string }{Version: c.Version})
-	}
-}
+	mux.HandleFunc("/livez", handleLivez)
+	mux.HandleFunc("/readyz", handleReadyz)
 
-// Status returns a combined snapshot: title, artist, listeners, bitrate, listenurl.
-// Allows the frontend to fetch everything in one round-trip instead of two.
-func Status() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		n := NowSnapshot()
-		listeners := n.Listeners
-		if listeners < 0 {
-			listeners = 0
-		}
-		writeJSON(w, struct {
-			Title     string  `json:"Title"`
-			Artist    string  `json:"Artist"`
-			Listeners int64   `json:"Listeners"`
-			Bitrate   float64 `json:"Bitrate"`
-			ListenURL string  `json:"ListenURL"`
-		}{
-			Title:     n.Song.Title,
-			Artist:    n.Song.Artist,
-			Listeners: listeners,
-			Bitrate:   n.Bitrate,
-			ListenURL: buildPublicStream(n.Host, n.Mountpoint),
-		})
-	}
-}
+	mux.HandleFunc("/api/radiodata/sse", handleSSE)
+	mux.HandleFunc("/api/nowplaying", handleNowPlaying)
+	mux.HandleFunc("/api/status", handleStatus)
+	mux.HandleFunc("/api/listeners", handleListeners)
+	mux.HandleFunc("/api/bitrate", handleBitrate)
+	mux.HandleFunc("/api/history", handleHistory)
 
-// AdminRescan triggers a DB rescan. Only registered when CSERVER_DEVMODE=true.
-func AdminRescan() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if !rescanRunning.CompareAndSwap(false, true) {
-			w.WriteHeader(http.StatusConflict)
-			_, _ = w.Write([]byte("rescan already running"))
-			return
-		}
-		go func() {
-			defer rescanRunning.Store(false)
-			slog.Info("Manual rescan triggered via /api/admin/rescan.")
-			resetCleanupRe()
-			if err := dbPopulate(); err != nil {
-				slog.Error("Rescan failed.", "error", err)
-			}
-		}()
-		w.WriteHeader(http.StatusAccepted)
-	}
-}
+	mux.HandleFunc("/api/request/", handleRequest)
+	mux.HandleFunc("/api/nowplaying/albumart", handleAlbumArt)
+	mux.HandleFunc("/api/search", handleSearch)
 
-func Readyz() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Use the cached ping result to avoid a DB round-trip on every probe.
-		if dbActive == nil || !dbPingOK.Load() {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}
-}
+	mux.HandleFunc("/api/admin/rescan", handleAdminRescan)
+	mux.HandleFunc("/api/dev/skip", handleDevSkip)
 
-func Healthz() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		dbOK := dbActive != nil && dbPingOK.Load()
-		n := NowSnapshot()
-		icecastOK := !streamIdle(n.Song.Title, n.Song.Artist)
-		status := "ok"
-		code := http.StatusOK
-		if !dbOK || !icecastOK {
-			status = "degraded"
-			code = http.StatusServiceUnavailable
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		if err := json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":  status,
-			"db":      dbOK,
-			"icecast": icecastOK,
-			"redis":   redisAvailable.Load(),
-			"version": c.Version,
-		}); err != nil {
-			slog.Warn("Healthz JSON encode error.", "error", err)
-		}
-	}
-}
+	mux.Handle("/", http.FileServer(http.Dir(c().RootPath)))
 
-func DevSkip() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if _, err := liquidsoapSkip(); err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}
+	return mux
 }

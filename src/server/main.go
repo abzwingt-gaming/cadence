@@ -14,224 +14,223 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"go.uber.org/automaxprocs/maxprocs"
 )
 
-// buildVersion is set at compile time via -ldflags "-X main.buildVersion=v1.2.3"
 var buildVersion = ""
-var c = ServerConfig{}
+
+var cfg atomic.Pointer[ServerConfig]
+
+func c() *ServerConfig { return cfg.Load() }
 
 type ServerConfig struct {
-	Version               string
-	RootPath              string
-	RequestRateLimit      int
-	Port                  string
-	MusicDir              string
-	LiquidsoapAddress     string
-	LiquidsoapPort        string
-	LiquidsoapHTTPPort    string
-	LiquidsoapMode        string
-	LiquidsoapTimeout     time.Duration
-	IcecastStatusURL      string
-	IcecastPollInterval   time.Duration
-	PublicStreamURL       string
-	DBBackend             string
-	DBRetries             int
-	DBRetryDelay          time.Duration
-	PostgresAddress       string
-	PostgresPort          string
-	PostgresUser          string
-	PostgresPassword      string
-	PostgresDBName        string
-	PostgresTableName     string
-	PostgresSSL           string
-	SQLitePath            string
-	RedisAddress          string
-	RedisPort             string
-	RedisPassword         string
-	RedisDB               int
-	ArtRateLimitWindow    time.Duration
-	ArtRateLimitMax       int
+	Version              string
+	RootPath             string
+	Port                 string
+	MusicDir             string
+	LiquidsoapAddress    string
+	LiquidsoapPort       string
+	LiquidsoapHTTPPort   string
+	LiquidsoapMode       string
+	LiquidsoapTimeout    time.Duration
+	IcecastStatusURL     string
+	IcecastPollInterval  time.Duration
+	PublicStreamURL      string
+	DBBackend            string
+	DBRetries            int
+	DBRetryDelay         time.Duration
+	PostgresAddress      string
+	PostgresPort         string
+	PostgresUser         string
+	PostgresPassword     string
+	PostgresDBName       string
+	PostgresTableName    string
+	PostgresSSL          string
+	SQLitePath           string
+	RedisAddress         string
+	RedisPort            string
+	RedisPassword        string
+	RedisDB              int
+
+	// RatelimitEnabled: built-in Redis rate limiter.
+	// Production behind Caddy: keep false; configure rate_limit in Caddyfile.
+	// Caddy sees real client IPs; this limiter keys on RemoteAddr = Caddy's IP.
+	// Direct access / dev: set true and add the redis compose profile.
+	RatelimitEnabled   bool
+	RequestRateLimit   int
+	ArtRateLimitWindow time.Duration
+	ArtRateLimitMax    int
+
+	// RealIPHeader / TrustedProxy: only used when RatelimitEnabled=true.
+	RealIPHeader string
+	TrustedProxy string
+
 	WhitelistPath         string
 	DevMode               bool
 	LogLevel              string
 	ScanWorkers           int
 	HistorySize           int
 	FsnotifyDebounce      time.Duration
+	PatternSeparator      string
 	TitleCleanupPatterns  string
 	ArtistCleanupPatterns string
-	PatternSeparator      string
-	// RealIPHeader: header set by Caddy/nginx with the real client IP.
-	// e.g. "X-Forwarded-For" or "X-Real-IP". Empty = use RemoteAddr.
-	RealIPHeader string
-	// TrustedProxy: CIDR or IP of the upstream proxy. Only read RealIPHeader
-	// when RemoteAddr matches this. Empty = trust all (only safe on LAN).
-	TrustedProxy string
 }
 
-func parseLogLevel(level string) slog.Level {
-	switch strings.ToLower(level) {
-	case "debug":
-		return slog.LevelDebug
-	case "warn":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
-}
-
-// logMu guards slog.SetDefault to prevent a data race when applyLogLevel
-// is called from the SIGHUP handler concurrently with active logging.
-var logMu sync.Mutex
-
-func applyLogLevel() {
-	level := parseLogLevel(c.LogLevel)
-	logMu.Lock()
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: level,
-	})))
-	logMu.Unlock()
-}
-
-func stripScheme(addr string) string {
-	for _, prefix := range []string{"https://", "http://"} {
-		if strings.HasPrefix(addr, prefix) {
-			slog.Warn("Scheme in address will be stripped.", "addr", addr)
-			return strings.TrimPrefix(addr, prefix)
-		}
-	}
-	return addr
-}
-
-func stripColon(port string) string {
-	return strings.TrimPrefix(port, ":")
-}
-
-func normalizePort(port string) string {
-	p := strings.TrimPrefix(port, ":")
-	return ":" + p
-}
-
-func envOrDefault(key, def string) string {
+func envStr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func envDuration(key string, def time.Duration) time.Duration {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	ms, err := strconv.Atoi(v)
-	if err != nil {
-		slog.Warn("Invalid duration env var, using default.", "key", key, "value", v, "default", def)
-		return def
-	}
-	return time.Duration(ms) * time.Millisecond
-}
-
 func envInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+		slog.Warn("Invalid int env var.", "key", key, "default", def)
 	}
-	n, err := strconv.Atoi(v)
+	return def
+}
+
+func envDur(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil {
+			return time.Duration(ms) * time.Millisecond
+		}
+		slog.Warn("Invalid duration env var (expected ms).", "key", key, "default", def)
+	}
+	return def
+}
+
+func envBool(key string) bool {
+	b, _ := strconv.ParseBool(os.Getenv(key))
+	return b
+}
+
+func stripScheme(s string) string {
+	for _, p := range []string{"https://", "http://"} {
+		if strings.HasPrefix(s, p) {
+			slog.Warn("Scheme stripped from address env var.", "value", s)
+			return strings.TrimPrefix(s, p)
+		}
+	}
+	return s
+}
+
+func normalizePort(s string) string {
+	return ":" + strings.TrimPrefix(s, ":")
+}
+
+func buildConfig() *ServerConfig {
+	sep := envStr("CSERVER_PATTERN_SEPARATOR", ";;")
+	ver := buildVersion
+	if ver == "" {
+		ver = envStr("CSERVER_VERSION", "dev")
+	}
+	return &ServerConfig{
+		Version:             ver,
+		RootPath:            envStr("CSERVER_ROOTPATH", "/app/public/"),
+		Port:                normalizePort(envStr("CSERVER_PORT", "8080")),
+		MusicDir:            os.Getenv("CSERVER_MUSIC_DIR"),
+		LiquidsoapAddress:   stripScheme(envStr("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap")),
+		LiquidsoapPort:      strings.TrimPrefix(envStr("CSERVER_LIQUIDSOAPPORT", "1234"), ":"),
+		LiquidsoapHTTPPort:  strings.TrimPrefix(envStr("CSERVER_LIQUIDSOAP_HTTP_PORT", "8001"), ":"),
+		LiquidsoapMode:      strings.ToLower(envStr("CSERVER_LIQUIDSOAP_MODE", "auto")),
+		LiquidsoapTimeout:   envDur("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5*time.Second),
+		IcecastStatusURL:    strings.TrimRight(envStr("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/"),
+		IcecastPollInterval: envDur("CSERVER_ICECAST_POLL_INTERVAL_MS", time.Second),
+		PublicStreamURL:     os.Getenv("CSERVER_PUBLIC_STREAM_URL"),
+		DBBackend:           strings.ToLower(envStr("CSERVER_DB_BACKEND", "sqlite")),
+		DBRetries:           envInt("CSERVER_DB_RETRIES", 5),
+		DBRetryDelay:        envDur("CSERVER_DB_RETRY_DELAY_MS", 3*time.Second),
+		PostgresAddress:     stripScheme(envStr("CSERVER_POSTGRESADDRESS", "cadence-postgres")),
+		PostgresPort:        strings.TrimPrefix(envStr("CSERVER_POSTGRESPORT", "5432"), ":"),
+		PostgresUser:        envStr("CSERVER_POSTGRESUSER", "postgres"),
+		PostgresPassword:    os.Getenv("POSTGRES_PASSWORD"),
+		PostgresDBName:      envStr("CSERVER_POSTGRESDBNAME", "cadence"),
+		PostgresTableName:   envStr("CSERVER_POSTGRESTABLENAME", "metadata"),
+		PostgresSSL:         envStr("CSERVER_POSTGRESSSL", "disable"),
+		SQLitePath:          envStr("CSERVER_SQLITE_PATH", "/data/cadence.db"),
+		RedisAddress:        stripScheme(envStr("CSERVER_REDISADDRESS", "cadence-redis")),
+		RedisPort:           strings.TrimPrefix(envStr("CSERVER_REDISPORT", "6379"), ":"),
+		RedisPassword:       os.Getenv("CSERVER_REDISPASSWORD"),
+		RedisDB:             envInt("CSERVER_REDISDB", 0),
+		RatelimitEnabled:    envBool("CSERVER_RATELIMIT_ENABLED"),
+		RequestRateLimit:    envInt("CSERVER_REQRATELIMIT", 5),
+		ArtRateLimitWindow:  envDur("CSERVER_ART_RATELIMIT_WINDOW_MS", 200*time.Second),
+		ArtRateLimitMax:     envInt("CSERVER_ART_RATELIMIT_MAX", 16),
+		RealIPHeader:        os.Getenv("CSERVER_REAL_IP_HEADER"),
+		TrustedProxy:        os.Getenv("CSERVER_TRUSTED_PROXY"),
+		WhitelistPath:       os.Getenv("CSERVER_WHITELIST_PATH"),
+		DevMode:             envBool("CSERVER_DEVMODE"),
+		LogLevel:            envStr("CSERVER_LOGLEVEL", "info"),
+		ScanWorkers:         envInt("CSERVER_SCAN_WORKERS", 4),
+		HistorySize:         envInt("CSERVER_HISTORY_SIZE", 10),
+		FsnotifyDebounce:    envDur("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3*time.Second),
+		PatternSeparator:    sep,
+		TitleCleanupPatterns: envStr("CSERVER_TITLE_CLEANUP_PATTERNS",
+			`\s*[\(\[][^\)\]]*[Oo]fficial[^\)\]]*[\)\]]`+sep+
+				`\s*[\(\[][^\)\]]*[Ll]yrics?[^\)\]]*[\)\]]`+sep+
+				`\s*[\(\[][^\)\]]*[Aa]udio[^\)\]]*[\)\]]`+sep+
+				`\s*[\(\[][Hh][Dd][\)\]]`+sep+
+				`\s*[\(\[][14][Kk][\)\]]`+sep+
+				`\s*- [Tt]opic$`+sep+
+				`\s*[\(\[][Mm]usic [Vv]ideo[^\)\]]*[\)\]]`+sep+
+				`\s*[\(\[](?:ft|feat)\.?[^\)\]]*[\)\]]`),
+		ArtistCleanupPatterns: envStr("CSERVER_ARTIST_CLEANUP_PATTERNS",
+			`\s*- [Tt]opic$`+sep+
+				`\s*- [Vv][Ee][Vv][Oo]$`+sep+
+				`\s*[Oo]fficial$`),
+	}
+}
+
+func validateConfig(conf *ServerConfig) {
+	if conf.RootPath == "/" || conf.RootPath == "" {
+		slog.Error("CSERVER_ROOTPATH must not be '/' or empty — would expose the entire filesystem.")
+		os.Exit(1)
+	}
+	info, err := os.Stat(conf.RootPath)
 	if err != nil {
-		slog.Warn("Invalid int env var, using default.", "key", key, "value", v, "default", def)
-		return def
+		slog.Error("CSERVER_ROOTPATH inaccessible.", "path", conf.RootPath, "error", err)
+		os.Exit(1)
 	}
-	return n
-}
+	if !info.IsDir() {
+		slog.Error("CSERVER_ROOTPATH is not a directory.", "path", conf.RootPath)
+		os.Exit(1)
+	}
 
-func loadConfig() {
-	if buildVersion != "" {
-		c.Version = buildVersion
+	if conf.RatelimitEnabled {
+		if conf.RealIPHeader == "" {
+			slog.Warn("[RATELIMIT] Built-in rate limiter ON but CSERVER_REAL_IP_HEADER is unset. " +
+				"Behind Caddy every request arrives from Caddy's IP — all clients share one bucket. " +
+				"Set CSERVER_REAL_IP_HEADER=X-Forwarded-For, or disable CSERVER_RATELIMIT_ENABLED and use Caddy rate_limit.")
+		}
+		if conf.RealIPHeader != "" && conf.TrustedProxy == "" {
+			slog.Warn("[RATELIMIT] CSERVER_REAL_IP_HEADER set but CSERVER_TRUSTED_PROXY is empty — "+
+				"trusting header from any RemoteAddr. Set CSERVER_TRUSTED_PROXY to Caddy's IP or CIDR.",
+				"header", conf.RealIPHeader)
+		}
 	} else {
-		c.Version = envOrDefault("CSERVER_VERSION", "dev")
+		slog.Info("[RATELIMIT] Built-in rate limiting disabled. Use Caddy rate_limit directive (see config/Caddyfile.example).")
 	}
-	c.RootPath             = envOrDefault("CSERVER_ROOTPATH", "/app/public/")
-	c.Port                 = normalizePort(envOrDefault("CSERVER_PORT", "8080"))
-	c.MusicDir             = os.Getenv("CSERVER_MUSIC_DIR")
-	c.LiquidsoapAddress    = stripScheme(envOrDefault("CSERVER_LIQUIDSOAPADDRESS", "liquidsoap"))
-	c.LiquidsoapPort       = stripColon(envOrDefault("CSERVER_LIQUIDSOAPPORT", "1234"))
-	c.LiquidsoapHTTPPort   = stripColon(envOrDefault("CSERVER_LIQUIDSOAP_HTTP_PORT", "8001"))
-	c.LiquidsoapMode       = strings.ToLower(envOrDefault("CSERVER_LIQUIDSOAP_MODE", "auto"))
-	c.LiquidsoapTimeout    = envDuration("CSERVER_LIQUIDSOAP_TIMEOUT_MS", 5*time.Second)
-	c.IcecastStatusURL     = strings.TrimRight(envOrDefault("CSERVER_ICECAST_STATUS_URL", "http://icecast2:8000"), "/")
-	c.IcecastPollInterval  = envDuration("CSERVER_ICECAST_POLL_INTERVAL_MS", time.Second)
-	c.PublicStreamURL      = os.Getenv("CSERVER_PUBLIC_STREAM_URL")
-	c.DBBackend            = strings.ToLower(envOrDefault("CSERVER_DB_BACKEND", "sqlite"))
-	c.DBRetries            = envInt("CSERVER_DB_RETRIES", 5)
-	c.DBRetryDelay         = envDuration("CSERVER_DB_RETRY_DELAY_MS", 3*time.Second)
-	c.PostgresAddress      = stripScheme(envOrDefault("CSERVER_POSTGRESADDRESS", "cadence-postgres"))
-	c.PostgresPort         = stripColon(envOrDefault("CSERVER_POSTGRESPORT", "5432"))
-	c.PostgresUser         = envOrDefault("CSERVER_POSTGRESUSER", "postgres")
-	c.PostgresPassword     = os.Getenv("POSTGRES_PASSWORD")
-	c.PostgresDBName       = envOrDefault("CSERVER_POSTGRESDBNAME", "cadence")
-	c.PostgresTableName    = envOrDefault("CSERVER_POSTGRESTABLENAME", "metadata")
-	c.PostgresSSL          = envOrDefault("CSERVER_POSTGRESSSL", "disable")
-	c.SQLitePath           = envOrDefault("CSERVER_SQLITE_PATH", "/data/cadence.db")
-	c.RedisAddress         = stripScheme(envOrDefault("CSERVER_REDISADDRESS", "cadence-redis"))
-	c.RedisPort            = stripColon(envOrDefault("CSERVER_REDISPORT", "6379"))
-	c.RedisPassword        = os.Getenv("CSERVER_REDISPASSWORD")
-	c.RedisDB              = envInt("CSERVER_REDISDB", 0)
-	c.RequestRateLimit     = envInt("CSERVER_REQRATELIMIT", 5)
-	c.ArtRateLimitWindow   = envDuration("CSERVER_ART_RATELIMIT_WINDOW_MS", 200*time.Second)
-	c.ArtRateLimitMax      = envInt("CSERVER_ART_RATELIMIT_MAX", 16)
-	c.WhitelistPath        = os.Getenv("CSERVER_WHITELIST_PATH")
-	c.DevMode, _           = strconv.ParseBool(os.Getenv("CSERVER_DEVMODE"))
-	c.LogLevel             = envOrDefault("CSERVER_LOGLEVEL", "info")
-	c.ScanWorkers          = envInt("CSERVER_SCAN_WORKERS", 4)
-	c.HistorySize          = envInt("CSERVER_HISTORY_SIZE", 10)
-	c.FsnotifyDebounce     = envDuration("CSERVER_FSNOTIFY_DEBOUNCE_MS", 3*time.Second)
-	c.PatternSeparator     = envOrDefault("CSERVER_PATTERN_SEPARATOR", ";;")
-	c.RealIPHeader         = os.Getenv("CSERVER_REAL_IP_HEADER")
-	c.TrustedProxy         = os.Getenv("CSERVER_TRUSTED_PROXY")
-	c.TitleCleanupPatterns = envOrDefault("CSERVER_TITLE_CLEANUP_PATTERNS",
-		`\s*[\(\[][^\)\]]*[Oo]fficial[^\)\]]*[\)\]]`+`;;`+
-		`\s*[\(\[][^\)\]]*[Ll]yrics?[^\)\]]*[\)\]]`+`;;`+
-		`\s*[\(\[][^\)\]]*[Aa]udio[^\)\]]*[\)\]]`+`;;`+
-		`\s*[\(\[][Hh][Dd][\)\]]`+`;;`+
-		`\s*[\(\[][14][Kk][\)\]]`+`;;`+
-		`\s*- [Tt]opic$`+`;;`+
-		`\s*[\(\[][Mm]usic [Vv]ideo[^\)\]]*[\)\]]`+`;;`+
-		`\s*[\(\[](?:ft|feat)\.?[^\)\]]*[\)\]]`)
-	c.ArtistCleanupPatterns = envOrDefault("CSERVER_ARTIST_CLEANUP_PATTERNS",
-		`\s*- [Tt]opic$`+`;;`+
-		`\s*- [Vv][Ee][Vv][Oo]$`+`;;`+
-		`\s*[Oo]fficial$`)
+
+	if conf.MusicDir == "" {
+		slog.Warn("CSERVER_MUSIC_DIR not set — music library will not be scanned.")
+	}
 }
 
-func initDB() {
-	var err error
-	for i := 1; i <= c.DBRetries; i++ {
-		slog.Info("Connecting to DB.", "backend", c.DBBackend, "attempt", i, "of", c.DBRetries)
-		switch c.DBBackend {
-		case "sqlite":
-			err = sqliteInit()
-		default:
-			err = postgresInit()
-		}
-		if err == nil {
-			slog.Info("DB connected, starting initial scan.")
-			if populateErr := dbPopulate(); populateErr != nil {
-				slog.Warn("Initial DB populate failed.", "error", populateErr)
-			}
-			return
-		}
-		slog.Warn("DB init failed.", "attempt", i, "of", c.DBRetries, "error", err)
-		if i < c.DBRetries {
-			slog.Info("Retrying DB connection.", "delay", c.DBRetryDelay)
-			time.Sleep(c.DBRetryDelay)
-		}
+var logMu sync.Mutex
+
+func applyLogLevel(conf *ServerConfig) {
+	lvls := map[string]slog.Level{
+		"debug": slog.LevelDebug,
+		"warn":  slog.LevelWarn,
+		"error": slog.LevelError,
 	}
-	slog.Error("DB unreachable after all retries.", "backend", c.DBBackend, "attempts", c.DBRetries, "last_error", err)
-	os.Exit(1)
+	lvl := lvls[strings.ToLower(conf.LogLevel)]
+	logMu.Lock()
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
+	logMu.Unlock()
 }
 
 var sighupReloading atomic.Bool
@@ -246,25 +245,45 @@ func sighupHandler() {
 		}
 		go func() {
 			defer sighupReloading.Store(false)
-			slog.Info("SIGHUP: reloading config and rescanning music library.")
-			loadConfig()
-			applyLogLevel()
+			slog.Info("SIGHUP: reloading config and rescanning library.")
+			newConf := buildConfig()
+			applyLogLevel(newConf)
+			cfg.Store(newConf)
 			resetCleanupRe()
-			// Trim history if HistorySize shrank after reload.
 			historyMu.Lock()
-			if len(history) > c.HistorySize {
-				history = history[len(history)-c.HistorySize:]
+			if len(history) > newConf.HistorySize {
+				history = history[len(history)-newConf.HistorySize:]
 			}
 			historyMu.Unlock()
 			if err := dbPopulate(); err != nil {
-				slog.Error("Rescan after SIGHUP failed.", "error", err)
+				slog.Error("Library rescan after SIGHUP failed.", "error", err)
 			}
 			slog.Info("SIGHUP reload complete.")
 		}()
 	}
 }
 
-// loggingMiddleware logs every request at DEBUG level with the real client IP.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := sw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, fmt.Errorf("hijack not supported")
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -275,89 +294,62 @@ func loggingMiddleware(next http.Handler) http.Handler {
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.status,
-			"latency", time.Since(start).String(),
-			"remote", ip,
+			"latency", time.Since(start),
+			"ip", ip,
 		)
 	})
 }
 
-// statusWriter wraps http.ResponseWriter to capture the status code and
-// proxy the optional http.Flusher and http.Hijacker interfaces so that SSE
-// and WebSocket handlers work correctly through the middleware chain.
-type statusWriter struct {
-	http.ResponseWriter
-	status int
-}
-
-func (sw *statusWriter) WriteHeader(code int) {
-	sw.status = code
-	sw.ResponseWriter.WriteHeader(code)
-}
-
-// Flush proxies to the underlying ResponseWriter when it implements http.Flusher.
-// Required for SSE (EventSource) to push chunks without buffering.
-func (sw *statusWriter) Flush() {
-	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-// Hijack proxies to the underlying ResponseWriter when it implements http.Hijacker.
-// Returns the exact types required by the http.Hijacker interface so that
-// WebSocket upgrades pass through the middleware correctly.
-func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	if h, ok := sw.ResponseWriter.(http.Hijacker); ok {
-		return h.Hijack()
-	}
-	return nil, nil, fmt.Errorf("hijack not supported by underlying ResponseWriter")
-}
-
 func main() {
-	loadConfig()
-	applyLogLevel()
-
-	// Honour Linux container CPU quota so runtime.NumCPU() reflects the
-	// actual available cores, preventing thread oversubscription.
-	if _, err := maxprocs.Set(maxprocs.Logger(func(f string, a ...interface{}) {
-		slog.Debug(fmt.Sprintf(f, a...))
-	})); err != nil {
-		slog.Warn("automaxprocs set failed.", "error", err)
-	}
-
-	// Warn when the proxy header is trusted from all sources — safe on a
-	// Docker LAN but dangerous if the port is internet-facing.
-	if c.RealIPHeader != "" && c.TrustedProxy == "" {
-		slog.Warn("CSERVER_REAL_IP_HEADER is set but CSERVER_TRUSTED_PROXY is empty: "+
-			"all RemoteAddr values are trusted as proxies. "+
-			"Set CSERVER_TRUSTED_PROXY to restrict this.",
-			"header", c.RealIPHeader,
-		)
-	}
+	conf := buildConfig()
+	applyLogLevel(conf)
+	cfg.Store(conf)
+	validateConfig(conf)
 
 	slog.Info("Cadence starting.",
-		"version", c.Version,
-		"port", c.Port,
-		"db", c.DBBackend,
-		"liquidsoap_mode", c.LiquidsoapMode,
-		"devmode", c.DevMode,
-		"real_ip_header", fmt.Sprintf("%q", c.RealIPHeader),
+		"version", conf.Version,
+		"port", conf.Port,
+		"db", conf.DBBackend,
+		"liquidsoap_mode", conf.LiquidsoapMode,
+		"devmode", conf.DevMode,
+		"ratelimit_builtin", conf.RatelimitEnabled,
 	)
 
-	if c.MusicDir == "" {
-		slog.Warn("CSERVER_MUSIC_DIR not set; music library will not be scanned.")
-	}
+	initLiquidsoapClient()
 
-	initDB()
+	var dbErr error
+	for i := 1; i <= conf.DBRetries; i++ {
+		slog.Info("Connecting to DB.", "backend", conf.DBBackend, "attempt", i)
+		switch conf.DBBackend {
+		case "sqlite":
+			dbErr = sqliteInit()
+		default:
+			dbErr = postgresInit()
+		}
+		if dbErr == nil {
+			if err := dbPopulate(); err != nil {
+				slog.Warn("Initial library scan failed.", "error", err)
+			}
+			break
+		}
+		slog.Warn("DB init failed.", "attempt", i, "error", dbErr)
+		if i < conf.DBRetries {
+			time.Sleep(conf.DBRetryDelay)
+		}
+	}
+	if dbErr != nil {
+		slog.Error("DB unreachable after all retries.", "attempts", conf.DBRetries, "error", dbErr)
+		os.Exit(1)
+	}
 
 	go redisInit()
 	go filesystemMonitor()
 	go icecastMonitor()
 	go sighupHandler()
 
-	handler := loggingMiddleware(routes())
-	slog.Info("HTTP server listening.", "addr", c.Port)
-	if err := http.ListenAndServe(c.Port, handler); err != nil {
-		slog.Error("HTTP server error.", "error", err)
+	slog.Info("HTTP server listening.", "addr", conf.Port)
+	if err := http.ListenAndServe(conf.Port, loggingMiddleware(routes())); err != nil {
+		slog.Error("HTTP server crashed.", "error", err)
 		os.Exit(1)
 	}
 }
