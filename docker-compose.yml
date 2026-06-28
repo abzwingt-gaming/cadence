@@ -8,8 +8,12 @@
 #   postgres  — adds postgres service
 #   redis     — adds redis for rate limiting
 #
-# Set in Portainer Stack → Environment variables:
-#   HOST_MUSIC_DIR   absolute path on Docker host, e.g. /srv/data/music
+# Required in Portainer Stack → Environment variables:
+#   HOST_MUSIC_DIR      absolute path on Docker host, e.g. /srv/data/music
+#
+# Recommended to override in Portainer:
+#   POSTGRES_PASSWORD   change from default before first deploy
+#   CSERVER_ADMIN_TOKEN set a strong random string to enable /api/admin/*
 
 services:
 
@@ -55,37 +59,48 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # General
+      # ── General ────────────────────────────────────────────────────────────
       CSERVER_PORT: "8080"
       CSERVER_ROOTPATH: /app/public/
       CSERVER_MUSIC_DIR: /music
-      CSERVER_LOGLEVEL: info
+      CSERVER_LOGLEVEL: info           # debug | info | warn | error
       CSERVER_DEVMODE: "false"
       CSERVER_HISTORY_SIZE: "10"
-      # Scan
+      # ── Admin auth ─────────────────────────────────────────────────────────
+      # Set to a strong random string to enable /api/admin/rescan.
+      # Leave empty to disable admin endpoints entirely.
+      CSERVER_ADMIN_TOKEN: ""
+      # ── Scan ───────────────────────────────────────────────────────────────
       CSERVER_SCAN_WORKERS: "4"
       CSERVER_FSNOTIFY_DEBOUNCE_MS: "3000"
-      # Icecast
+      # ── DB retry ───────────────────────────────────────────────────────────
+      CSERVER_DB_RETRIES: "5"
+      CSERVER_DB_RETRY_DELAY_MS: "3000"
+      # ── Icecast ────────────────────────────────────────────────────────────
       CSERVER_ICECAST_STATUS_URL: http://icecast2:8000
       CSERVER_ICECAST_POLL_INTERVAL_MS: "1000"
-      CSERVER_PUBLIC_STREAM_URL: ""   # e.g. https://radio.lan.zedzulmeng.online
-      # Liquidsoap
+      # Set to your Caddy URL if proxying the stream externally:
+      CSERVER_PUBLIC_STREAM_URL: ""    # e.g. https://radio.lan.zedzulmeng.online
+      # ── Liquidsoap ─────────────────────────────────────────────────────────
       CSERVER_LIQUIDSOAPADDRESS: liquidsoap
       CSERVER_LIQUIDSOAPPORT: "1234"
       CSERVER_LIQUIDSOAP_HTTP_PORT: "8001"
       CSERVER_LIQUIDSOAP_MODE: auto
       CSERVER_LIQUIDSOAP_TIMEOUT_MS: "5000"
-      # Rate limiting (keep false behind Caddy — use Caddy rate_limit instead)
+      # ── Rate limiting ──────────────────────────────────────────────────────
+      # Keep false when behind Caddy — use Caddy rate_limit instead.
+      # Set true + add redis profile only for direct/dev access.
       CSERVER_RATELIMIT_ENABLED: "false"
       CSERVER_REAL_IP_HEADER: X-Forwarded-For
-      CSERVER_TRUSTED_PROXY: ""
+      # MUST be set when CSERVER_REAL_IP_HEADER is set, or header is ignored.
+      CSERVER_TRUSTED_PROXY: ""        # e.g. 172.20.0.0/16 (Caddy container CIDR)
       CSERVER_REQRATELIMIT: "5"
       CSERVER_ART_RATELIMIT_MAX: "16"
       CSERVER_ART_RATELIMIT_WINDOW_MS: "200000"
-      # Database
-      CSERVER_DB_BACKEND: sqlite          # change to postgres if using that profile
+      # ── Database ───────────────────────────────────────────────────────────
+      CSERVER_DB_BACKEND: sqlite        # sqlite | postgres
       CSERVER_SQLITE_PATH: /data/cadence.db
-      # Postgres (only used when CSERVER_DB_BACKEND=postgres)
+      # ── Postgres (only used when CSERVER_DB_BACKEND=postgres) ─────────────
       CSERVER_POSTGRESADDRESS: cadence-postgres
       CSERVER_POSTGRESPORT: "5432"
       CSERVER_POSTGRESUSER: postgres
@@ -93,11 +108,17 @@ services:
       CSERVER_POSTGRESDBNAME: cadence
       CSERVER_POSTGRESTABLENAME: metadata
       CSERVER_POSTGRESSSL: disable
-      # Redis (only used when CSERVER_RATELIMIT_ENABLED=true)
+      # ── Redis (only used when CSERVER_RATELIMIT_ENABLED=true) ─────────────
       CSERVER_REDISADDRESS: cadence-redis
       CSERVER_REDISPORT: "6379"
       CSERVER_REDISPASSWORD: ""
       CSERVER_REDISDB: "0"
+      # ── Advanced / optional ────────────────────────────────────────────────
+      # CSERVER_WHITELIST_PATH: ""       # path to song whitelist file
+      # CSERVER_PATTERN_SEPARATOR: ";;"  # separator for cleanup pattern lists
+      # CSERVER_TITLE_CLEANUP_PATTERNS: "" # override default title cleanup regex
+      # CSERVER_ARTIST_CLEANUP_PATTERNS: "" # override default artist cleanup regex
+      # CSERVER_VERSION: ""              # override reported version string
     volumes:
       - ${HOST_MUSIC_DIR}:/music:ro
       - /srv/ssd/HOMELAB/cadence/custom.css:/app/public/css/custom.css:ro
@@ -148,8 +169,7 @@ services:
     image: redis:7-alpine
     container_name: cadence-redis
     restart: unless-stopped
-    command: >-
-      redis-server --save "" --appendonly no
+    command: redis-server --save "" --appendonly no
     expose:
       - "6379"
     networks:

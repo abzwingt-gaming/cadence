@@ -21,15 +21,21 @@ func realIP(r *http.Request) (string, error) {
 		return remoteIP, nil
 	}
 
-	if conf.TrustedProxy != "" {
-		_, trustedNet, err := net.ParseCIDR(conf.TrustedProxy)
-		if err != nil {
-			if remoteIP != conf.TrustedProxy {
-				return remoteIP, nil
-			}
-		} else if !trustedNet.Contains(net.ParseIP(remoteIP)) {
+	// BUG FIX: if RealIPHeader is set but TrustedProxy is empty, trusting the
+	// header from any client is a spoofing vector. Fail-safe: only use the
+	// header when TrustedProxy is explicitly configured.
+	if conf.TrustedProxy == "" {
+		return remoteIP, nil
+	}
+
+	_, trustedNet, err := net.ParseCIDR(conf.TrustedProxy)
+	if err != nil {
+		// TrustedProxy is a plain IP, not CIDR.
+		if remoteIP != conf.TrustedProxy {
 			return remoteIP, nil
 		}
+	} else if !trustedNet.Contains(net.ParseIP(remoteIP)) {
+		return remoteIP, nil
 	}
 
 	if val := r.Header.Get(conf.RealIPHeader); val != "" {
@@ -49,6 +55,24 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		slog.Warn("JSON encode error.", "error", err)
 	}
+}
+
+// ── adminAuth ─────────────────────────────────────────────────────────────────
+
+// adminAuth checks the X-Admin-Token header against CSERVER_ADMIN_TOKEN.
+// Returns true (and writes 401/403) when the request is not authorised.
+// When CSERVER_ADMIN_TOKEN is empty the endpoint is disabled entirely.
+func adminAuth(w http.ResponseWriter, r *http.Request) bool {
+	token := c().AdminToken
+	if token == "" {
+		http.Error(w, "admin endpoints disabled: set CSERVER_ADMIN_TOKEN", http.StatusForbidden)
+		return true
+	}
+	if r.Header.Get("X-Admin-Token") != token {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return true
+	}
+	return false
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -173,6 +197,10 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 // ── Admin / dev ───────────────────────────────────────────────────────────────
 
 func handleAdminRescan(w http.ResponseWriter, r *http.Request) {
+	// BUG FIX: endpoint now requires X-Admin-Token matching CSERVER_ADMIN_TOKEN.
+	if adminAuth(w, r) {
+		return
+	}
 	if sighupReloading.Load() {
 		http.Error(w, "scan already in progress", http.StatusConflict)
 		return

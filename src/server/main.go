@@ -61,9 +61,11 @@ type ServerConfig struct {
 	ArtRateLimitMax    int
 
 	// RealIPHeader / TrustedProxy: only used when RatelimitEnabled=true.
+	// TrustedProxy MUST be set when RealIPHeader is set — see validateConfig.
 	RealIPHeader string
 	TrustedProxy string
 
+	AdminToken            string // CSERVER_ADMIN_TOKEN — required for /api/admin/*
 	WhitelistPath         string
 	DevMode               bool
 	LogLevel              string
@@ -161,6 +163,7 @@ func buildConfig() *ServerConfig {
 		ArtRateLimitMax:     envInt("CSERVER_ART_RATELIMIT_MAX", 16),
 		RealIPHeader:        os.Getenv("CSERVER_REAL_IP_HEADER"),
 		TrustedProxy:        os.Getenv("CSERVER_TRUSTED_PROXY"),
+		AdminToken:          os.Getenv("CSERVER_ADMIN_TOKEN"),
 		WhitelistPath:       os.Getenv("CSERVER_WHITELIST_PATH"),
 		DevMode:             envBool("CSERVER_DEVMODE"),
 		LogLevel:            envStr("CSERVER_LOGLEVEL", "info"),
@@ -199,6 +202,10 @@ func validateConfig(conf *ServerConfig) {
 		os.Exit(1)
 	}
 
+	if conf.AdminToken == "" {
+		slog.Warn("CSERVER_ADMIN_TOKEN is not set — /api/admin/* endpoints are disabled.")
+	}
+
 	if conf.RatelimitEnabled {
 		if conf.RealIPHeader == "" {
 			slog.Warn("[RATELIMIT] Built-in rate limiter ON but CSERVER_REAL_IP_HEADER is unset. " +
@@ -207,7 +214,7 @@ func validateConfig(conf *ServerConfig) {
 		}
 		if conf.RealIPHeader != "" && conf.TrustedProxy == "" {
 			slog.Warn("[RATELIMIT] CSERVER_REAL_IP_HEADER set but CSERVER_TRUSTED_PROXY is empty — "+
-				"trusting header from any RemoteAddr. Set CSERVER_TRUSTED_PROXY to Caddy's IP or CIDR.",
+				"header will be IGNORED (fail-safe). Set CSERVER_TRUSTED_PROXY to Caddy's IP or CIDR.",
 				"header", conf.RealIPHeader)
 		}
 	} else {
@@ -221,13 +228,23 @@ func validateConfig(conf *ServerConfig) {
 
 var logMu sync.Mutex
 
+// validLogLevels maps recognised level strings to slog.Level.
+// An unrecognised string is treated as INFO and a warning is emitted.
+var validLogLevels = map[string]slog.Level{
+	"debug": slog.LevelDebug,
+	"info":  slog.LevelInfo,
+	"warn":  slog.LevelWarn,
+	"error": slog.LevelError,
+}
+
 func applyLogLevel(conf *ServerConfig) {
-	lvls := map[string]slog.Level{
-		"debug": slog.LevelDebug,
-		"warn":  slog.LevelWarn,
-		"error": slog.LevelError,
+	key := strings.ToLower(conf.LogLevel)
+	lvl, ok := validLogLevels[key]
+	if !ok {
+		// BUG FIX: previously silently defaulted to INFO on typo.
+		slog.Warn("Unknown CSERVER_LOGLEVEL; defaulting to info.", "value", conf.LogLevel)
+		lvl = slog.LevelInfo
 	}
-	lvl := lvls[strings.ToLower(conf.LogLevel)]
 	logMu.Lock()
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})))
 	logMu.Unlock()
@@ -327,9 +344,13 @@ func main() {
 			dbErr = postgresInit()
 		}
 		if dbErr == nil {
+			// BUG FIX: set dbReady=true only after populate succeeds.
+			// Previously dbReady was never flipped — /readyz always returned 503
+			// until this line was added, and was never reset on DB loss.
 			if err := dbPopulate(); err != nil {
 				slog.Warn("Initial library scan failed.", "error", err)
 			}
+			dbReady.Store(true)
 			break
 		}
 		slog.Warn("DB init failed.", "attempt", i, "error", dbErr)
