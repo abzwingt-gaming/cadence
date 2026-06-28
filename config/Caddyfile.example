@@ -1,99 +1,55 @@
-# Caddyfile.example — Cadence behind Caddy reverse proxy
-# Replace radio.example.com with your domain.
+# Caddyfile example for Cadence
+# Assumes cadence container is on services-net reachable at http://cadence:8080
+
+# LAN-only (homelab default)
+# cadence.lan.{$DOMAIN} {
+#     import lanet_only cadence 8080
+# }
+
+# Public domain
+# cadence.zedzulmeng.online {
 #
-# Caddy automatically sets X-Forwarded-For with the real client IP.
-# Set CSERVER_REAL_IP_HEADER=X-Forwarded-For in cadence.env so that
-# rate limiting works correctly per client (not per Caddy container IP).
-
-radio.example.com {
-    encode zstd gzip
-
-    # Security headers
-    header {
-        X-Frame-Options SAMEORIGIN
-        X-Content-Type-Options nosniff
-        X-Robots-Tag "noindex, nofollow"
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
-        Referrer-Policy "same-origin"
-        Permissions-Policy "geolocation=(), microphone=(), camera=()"
-        -Server
-    }
-
-    # SSE endpoint — must not buffer, must not timeout
-    # Cache-Control + X-Accel-Buffering prevent intermediate proxy buffering.
-    handle /api/radiodata/sse {
-        header Cache-Control no-cache
-        header X-Accel-Buffering no
-        reverse_proxy cadence:8080 {
-            flush_interval -1
-            transport http {
-                read_timeout 0
-            }
-        }
-    }
-
-    # Icecast audio stream — flush immediately, no timeout
-    handle /cadence1 {
-        reverse_proxy icecast2:8000 {
-            flush_interval -1
-            transport http {
-                read_timeout 0
-            }
-        }
-    }
-
-    # Icecast MP3 mount (uncomment if you enabled MP3 output in liquidsoap.liq)
-    # handle /cadence1.mp3 {
-    #     reverse_proxy icecast2:8000 {
-    #         flush_interval -1
-    #         transport http { read_timeout 0 }
-    #     }
-    # }
-
-    # Icecast JSON status — used internally by cadence; expose only if needed
-    handle /status-json.xsl {
-        reverse_proxy icecast2:8000
-    }
-
-    # Cadence API + frontend
-    handle {
-        reverse_proxy cadence:8080
-    }
-}
-
-# -----------------------------------------------------------------------
-# Homelab LAN example (internal CA / split-horizon DNS / .lan domain)
-# Uncomment and adjust. Use 'tls internal' for a self-signed cert.
-# Set CSERVER_TRUSTED_PROXY to your Docker bridge CIDR in cadence.env.
-# -----------------------------------------------------------------------
-# radio.lan.example.com {
-#     tls internal
+#     # Rate limiting (Caddy layer - CSERVER_RATELIMIT_ENABLED stays false)
+#     # Requires caddy-ratelimit plugin: https://github.com/mholt/caddy-ratelimit
 #
-#     encode zstd gzip
+#     @request_api path /api/request/*
+#     rate_limit @request_api {
+#         zone requests {
+#             key      {remote_host}
+#             events   5
+#             window   1m
+#         }
+#     }
+#
+#     @art_api path /api/nowplaying/albumart
+#     rate_limit @art_api {
+#         zone albumart {
+#             key      {remote_host}
+#             events   16
+#             window   3m
+#         }
+#     }
+#
+#     reverse_proxy cadence:8080 {
+#         header_up X-Forwarded-For {remote_host}
+#         header_up X-Real-IP       {remote_host}
+#         health_uri      /livez
+#         health_interval 15s
+#         health_timeout  5s
+#     }
 #
 #     header {
-#         X-Frame-Options SAMEORIGIN
-#         X-Content-Type-Options nosniff
-#         -Server
+#         Strict-Transport-Security "max-age=31536000; includeSubDomains"
+#         X-Content-Type-Options    "nosniff"
+#         X-Frame-Options           "SAMEORIGIN"
+#         Referrer-Policy           "strict-origin-when-cross-origin"
+#         Content-Security-Policy   "default-src 'self'; media-src 'self' blob:; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;"
 #     }
 #
-#     handle /api/radiodata/sse {
-#         header Cache-Control no-cache
-#         header X-Accel-Buffering no
-#         reverse_proxy cadence:8080 {
-#             flush_interval -1
-#             transport http { read_timeout 0 }
-#         }
-#     }
-#
-#     handle /cadence1 {
-#         reverse_proxy icecast2:8000 {
-#             flush_interval -1
-#             transport http { read_timeout 0 }
-#         }
-#     }
-#
-#     handle {
-#         reverse_proxy cadence:8080
+#     # Prevent Caddy buffering the SSE stream
+#     @sse path /api/radiodata/sse
+#     header @sse {
+#         X-Accel-Buffering "no"
+#         Cache-Control     "no-cache"
 #     }
 # }

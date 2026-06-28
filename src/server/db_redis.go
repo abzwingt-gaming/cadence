@@ -1,12 +1,15 @@
 // db_redis.go
-// Rate limiting via Redis. Redis is optional — if unavailable, all requests pass through.
+// Optional Redis integration.
 //
-// Behind a reverse proxy (Caddy, nginx):
-//   Set CSERVER_REAL_IP_HEADER=X-Forwarded-For   (Caddy default)
-//   Set CSERVER_REAL_IP_HEADER=X-Real-IP          (nginx default)
-//   Optionally set CSERVER_TRUSTED_PROXY=172.20.0.0/16 to only trust that CIDR.
+// Two independent uses:
+//   1. Built-in rate limiting (only when CSERVER_RATELIMIT_ENABLED=true).
+//      Production with Caddy: leave disabled — Caddy handles rate limiting per
+//      real client IP via rate_limit directive (see config/Caddyfile.example).
+//      The built-in limiter keys on RemoteAddr which is always Caddy's IP
+//      behind a proxy, making per-client limiting impossible without extra config.
 //
-// To disable rate limiting entirely: don't run Redis (omit --profile redis).
+//   2. Album-art cache clear on track change (artCacheClear).
+//      Always attempted when Redis is reachable, regardless of RatelimitEnabled.
 
 package main
 
@@ -14,187 +17,147 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-var ctx = context.Background()
-var dbr = RedisClient{}
+var (
+	redisClient    *redis.Client
+	redisAvailable bool
+)
 
-// redisAvailable is set once in redisInit; read concurrently from HTTP handlers.
-var redisAvailable atomic.Bool
-
-type RedisClient struct {
-	RateLimitRequest *redis.Client
-	RateLimitArt     *redis.Client
-}
-
-func redisAddr() string {
-	port := strings.TrimPrefix(c.RedisPort, ":")
-	return net.JoinHostPort(c.RedisAddress, port)
-}
-
+// redisInit connects with exponential-backoff retries and runs a background
+// ping loop for reconnect detection. Call as a goroutine.
 func redisInit() {
-	// Redis supports DB indices 0–15. Clamp so DB+1 for art never overflows.
-	const redisMaxDB = 15
-	db := c.RedisDB
-	if db < 0 || db > redisMaxDB-1 {
-		slog.Warn("CSERVER_REDISDB out of range, clamping.",
-			"requested", db, "clamped", 0)
-		db = 0
-	}
-	dbArt := db + 1 // dedicated DB so FlushDB on track-change is safe
-
-	addr := redisAddr()
-	slog.Info("Connecting to Redis.", "addr", addr, "db", db, "db_art", dbArt)
-	rdb := redis.NewClient(&redis.Options{
+	addr := fmt.Sprintf("%s:%s", c().RedisAddress, c().RedisPort)
+	opts := &redis.Options{
 		Addr:     addr,
-		Password: c.RedisPassword,
-		DB:       db,
-	})
-	if _, err := rdb.Ping(ctx).Result(); err != nil {
-		slog.Warn("Redis unavailable — rate limiting disabled.", "addr", addr, "error", err)
+		Password: c().RedisPassword,
+		DB:       c().RedisDB,
+	}
+
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+
+	for {
+		cl := redis.NewClient(opts)
+		if err := cl.Ping(context.Background()).Err(); err != nil {
+			slog.Warn("Redis connect failed; retrying.", "addr", addr, "error", err, "backoff", backoff)
+			_ = cl.Close()
+			time.Sleep(backoff)
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
+			continue
+		}
+		redisClient = cl
+		redisAvailable = true
+		slog.Info("Redis connected.", "addr", addr)
+		break
+	}
+
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if err := redisClient.Ping(context.Background()).Err(); err != nil {
+			slog.Warn("Redis ping failed; marking unavailable.", "error", err)
+			redisAvailable = false
+			cl := redis.NewClient(opts)
+			if err2 := cl.Ping(context.Background()).Err(); err2 == nil {
+				_ = redisClient.Close()
+				redisClient = cl
+				redisAvailable = true
+				slog.Info("Redis reconnected.", "addr", addr)
+			} else {
+				_ = cl.Close()
+			}
+		}
+	}
+}
+
+// artCacheClear removes art cache keys from Redis on track change.
+// Uses SCAN+DEL to avoid blocking with FLUSHDB.
+func artCacheClear() {
+	if !redisAvailable || redisClient == nil {
 		return
 	}
-	dbr.RateLimitRequest = rdb
-	dbr.RateLimitArt = redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: c.RedisPassword,
-		DB:       dbArt,
-	})
-	redisAvailable.Store(true)
-	slog.Info("Redis connected — rate limiting enabled.",
-		"addr", addr,
-		"real_ip_header", c.RealIPHeader,
-		"trusted_proxy", c.TrustedProxy,
-		"req_rate_limit_sec", c.RequestRateLimit,
-		"art_window", c.ArtRateLimitWindow,
-		"art_max", c.ArtRateLimitMax,
-	)
+	ctx := context.Background()
+	var cursor uint64
+	var keys []string
+	for {
+		batch, next, err := redisClient.Scan(ctx, cursor, "art:*", 100).Result()
+		if err != nil {
+			slog.Warn("Redis SCAN failed during art cache clear.", "error", err)
+			return
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	if len(keys) > 0 {
+		if err := redisClient.Del(ctx, keys...).Err(); err != nil {
+			slog.Warn("Redis DEL failed during art cache clear.", "error", err)
+		}
+	}
 }
 
-// realIP extracts the true client IP.
-// When CSERVER_REAL_IP_HEADER is set (e.g. "X-Forwarded-For" for Caddy),
-// it reads that header — but only if RemoteAddr matches CSERVER_TRUSTED_PROXY
-// (or if TrustedProxy is empty, which trusts all — safe on a LAN Docker network).
-// Falls back to RemoteAddr when the header is absent or the proxy is not trusted.
-func realIP(r *http.Request) (string, error) {
-	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+// luaIncrWithTTL atomically increments a counter and sets TTL on first call.
+// Fixes the INCR+EXPIRE TOCTOU race: without this, two concurrent requests
+// can both see count==1 and each reset the TTL independently.
+var luaIncrWithTTL = redis.NewScript(`
+	local n = redis.call("INCR", KEYS[1])
+	if n == 1 then
+		redis.call("EXPIRE", KEYS[1], ARGV[1])
+	end
+	return n
+`)
+
+// rateLimitRequest enforces per-IP song request rate limiting.
+// Returns true (and writes 429) when the client is over limit.
+// No-op when RatelimitEnabled=false or Redis is unavailable.
+func rateLimitRequest(w http.ResponseWriter, r *http.Request) bool {
+	if !c().RatelimitEnabled || !redisAvailable || redisClient == nil {
+		return false
+	}
+	ip, _ := realIP(r)
+	key := "rl:req:" + ip
+	windowSec := int64(c().ArtRateLimitWindow.Seconds())
+	limit := int64(c().RequestRateLimit)
+
+	n, err := luaIncrWithTTL.Run(context.Background(), redisClient, []string{key}, windowSec).Int64()
 	if err != nil {
-		// RemoteAddr may have no port in some edge cases
-		remoteIP = r.RemoteAddr
+		slog.Warn("Rate limit script error; allowing request.", "error", err)
+		return false
 	}
-
-	if c.RealIPHeader == "" {
-		// No proxy configured — use RemoteAddr directly.
-		if remoteIP == "" {
-			return "", fmt.Errorf("empty RemoteAddr")
-		}
-		return remoteIP, nil
+	if n > limit {
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+		return true
 	}
-
-	// Check trusted proxy.
-	if c.TrustedProxy != "" {
-		_, trustedNet, parseErr := net.ParseCIDR(c.TrustedProxy)
-		if parseErr != nil {
-			// Try plain IP match
-			trustedIP := net.ParseIP(c.TrustedProxy)
-			parsedRemote := net.ParseIP(remoteIP)
-			if trustedIP == nil || parsedRemote == nil || !trustedIP.Equal(parsedRemote) {
-				// Proxy not trusted; use RemoteAddr
-				return remoteIP, nil
-			}
-		} else {
-			parsedRemote := net.ParseIP(remoteIP)
-			if parsedRemote == nil || !trustedNet.Contains(parsedRemote) {
-				return remoteIP, nil
-			}
-		}
-	}
-
-	// Read the header — take the first (leftmost) IP in X-Forwarded-For.
-	hdrVal := r.Header.Get(c.RealIPHeader)
-	if hdrVal == "" {
-		return remoteIP, nil
-	}
-	parts := strings.SplitN(hdrVal, ",", 2)
-	ip := strings.TrimSpace(parts[0])
-	if ip == "" {
-		return remoteIP, nil
-	}
-	return ip, nil
+	return false
 }
 
-// rateLimitRequest allows one request per CSERVER_REQRATELIMIT seconds per IP.
-func rateLimitRequest(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable.Load() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		ip, err := realIP(r)
-		if err != nil {
-			slog.Error("realIP failed in rateLimitRequest.", "remote", r.RemoteAddr, "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		key := "rl:req:" + ip
-		window := time.Duration(c.RequestRateLimit) * time.Second
-		// SETNX: set key with TTL only if it does not exist.
-		set, err := dbr.RateLimitRequest.SetNX(ctx, key, 1, window).Result()
-		if err != nil {
-			slog.Warn("Redis error in rateLimitRequest, passing through.", "ip", ip, "error", err)
-			next.ServeHTTP(w, r)
-			return
-		}
-		if !set {
-			// Key already existed → rate limited.
-			slog.Info("Request rate limited.", "ip", ip)
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
+// rateLimitArt enforces per-IP album-art rate limiting.
+func rateLimitArt(w http.ResponseWriter, r *http.Request) bool {
+	if !c().RatelimitEnabled || !redisAvailable || redisClient == nil {
+		return false
+	}
+	ip, _ := realIP(r)
+	key := "rl:art:" + ip
+	windowSec := int64(c().ArtRateLimitWindow.Seconds())
+	limit := int64(c().ArtRateLimitMax)
 
-// rateLimitArt allows up to CSERVER_ART_RATELIMIT_MAX album-art fetches
-// per CSERVER_ART_RATELIMIT_WINDOW_MS per IP.
-func rateLimitArt(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !redisAvailable.Load() {
-			next.ServeHTTP(w, r)
-			return
-		}
-		ip, err := realIP(r)
-		if err != nil {
-			slog.Error("realIP failed in rateLimitArt.", "remote", r.RemoteAddr, "error", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		key := "rl:art:" + ip
-		// INCR atomically increments (or creates at 1). Single round-trip.
-		count, err := dbr.RateLimitArt.Incr(ctx, key).Result()
-		if err != nil {
-			slog.Warn("Redis INCR error in rateLimitArt, passing through.", "ip", ip, "error", err)
-			next.ServeHTTP(w, r)
-			return
-		}
-		if count == 1 {
-			// First request in this window: set the expiry.
-			if expErr := dbr.RateLimitArt.Expire(ctx, key, c.ArtRateLimitWindow).Err(); expErr != nil {
-				slog.Warn("Redis Expire error in rateLimitArt.", "ip", ip, "error", expErr)
-			}
-		}
-		if count > int64(c.ArtRateLimitMax) {
-			slog.Debug("Art rate limit reached.", "ip", ip, "count", count, "max", c.ArtRateLimitMax)
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	n, err := luaIncrWithTTL.Run(context.Background(), redisClient, []string{key}, windowSec).Int64()
+	if err != nil {
+		slog.Warn("Art rate limit script error; allowing request.", "error", err)
+		return false
+	}
+	if n > limit {
+		http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
+		return true
+	}
+	return false
 }
