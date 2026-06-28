@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -31,13 +33,16 @@ func artCacheClear() {
 		artCache.Delete(k)
 		return true
 	})
+	// Also forget any in-flight singleflight keys so the next request
+	// re-fetches art for the new track rather than returning stale data.
+	artFlight = singleflight.Group{}
 }
 
 type RadioInfo struct {
 	Song       SongData
 	Host       string
 	Mountpoint string
-	Listeners  int64   // -1 = icecast unreachable / stream idle
+	Listeners  int64
 	Bitrate    float64
 }
 
@@ -47,7 +52,7 @@ type SongData struct {
 	Title  string
 	Album  string
 	Genre  string
-	Year   string // stored as TEXT/VARCHAR; kept as string to avoid scan type mismatch
+	Year   string
 	Path   string
 }
 
@@ -67,7 +72,6 @@ func NowSnapshot() RadioInfo {
 }
 
 // liquidsoapHTTP calls the Liquidsoap 2.x HTTP harbor API.
-// Port is stored without colon; URL is built cleanly.
 func liquidsoapHTTP(cmd, arg string) (string, error) {
 	url := fmt.Sprintf("http://%s:%s/api/%s",
 		c.LiquidsoapAddress, c.LiquidsoapHTTPPort, cmd)
@@ -102,7 +106,6 @@ func liquidsoapTelnet(cmd string) (string, error) {
 		return "", err
 	}
 	defer conn.Close()
-	// SetDeadline bounds both write and read; error is non-fatal but logged.
 	if dlErr := conn.SetDeadline(time.Now().Add(c.LiquidsoapTimeout)); dlErr != nil {
 		slog.Warn("Liquidsoap telnet SetDeadline failed.", "error", dlErr)
 	}
@@ -114,7 +117,7 @@ func liquidsoapTelnet(cmd string) (string, error) {
 	if err != nil {
 		slog.Warn("Liquidsoap telnet read partial.", "cmd", cmd, "error", err)
 	}
-	fmt.Fprintf(conn, "quit\n") //nolint:errcheck // best-effort
+	fmt.Fprintf(conn, "quit\n") //nolint:errcheck
 	slog.Debug("Liquidsoap telnet ok.", "cmd", cmd, "resp", strings.TrimSpace(msg))
 	return msg, err
 }
@@ -126,7 +129,7 @@ func liquidsoapRequest(path string) (string, error) {
 		return liquidsoapHTTP("cadence1.push", path)
 	case "telnet":
 		return liquidsoapTelnet(fmt.Sprintf("cadence1.push %s", path))
-	default: // auto: try HTTP first, fall back to telnet
+	default:
 		if msg, err := liquidsoapHTTP("cadence1.push", path); err == nil {
 			return msg, nil
 		}
@@ -150,6 +153,8 @@ func liquidsoapSkip() (string, error) {
 	}
 }
 
+// filesystemMonitor watches c.MusicDir recursively (including subdirectories)
+// using fsnotify. File-system events are debounced before triggering a rescan.
 func filesystemMonitor() {
 	if c.MusicDir == "" {
 		slog.Info("Filesystem monitor disabled (CSERVER_MUSIC_DIR not set).")
@@ -161,11 +166,27 @@ func filesystemMonitor() {
 		return
 	}
 	defer watcher.Close()
-	if err = watcher.Add(c.MusicDir); err != nil {
-		slog.Error("Cannot watch music dir.", "dir", c.MusicDir, "error", err)
+
+	// Walk the music directory tree and watch every subdirectory,
+	// because fsnotify does not recurse into subdirectories by default.
+	watchErr := filepath.Walk(c.MusicDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			slog.Warn("Walk error while setting up watcher.", "path", path, "error", err)
+			return nil
+		}
+		if info.IsDir() {
+			if addErr := watcher.Add(path); addErr != nil {
+				slog.Warn("Cannot watch subdirectory.", "dir", path, "error", addErr)
+			}
+		}
+		return nil
+	})
+	if watchErr != nil {
+		slog.Error("Cannot walk music dir for watcher setup.", "dir", c.MusicDir, "error", watchErr)
 		return
 	}
-	slog.Info("Filesystem monitor active.", "dir", c.MusicDir, "debounce", c.FsnotifyDebounce)
+	slog.Info("Filesystem monitor active (recursive).", "dir", c.MusicDir, "debounce", c.FsnotifyDebounce)
+
 	var debounce *time.Timer
 	for {
 		select {
@@ -175,6 +196,17 @@ func filesystemMonitor() {
 				return
 			}
 			slog.Debug("Filesystem event.", "event", event)
+			// When a new directory is created, add it to the watch list
+			// immediately so files added shortly after are also caught.
+			if event.Has(fsnotify.Create) {
+				if fi, statErr := os.Stat(event.Name); statErr == nil && fi.IsDir() {
+					if addErr := watcher.Add(event.Name); addErr != nil {
+						slog.Warn("Cannot watch new subdirectory.", "dir", event.Name, "error", addErr)
+					} else {
+						slog.Debug("Watching new subdirectory.", "dir", event.Name)
+					}
+				}
+			}
 			if debounce != nil {
 				debounce.Stop()
 			}
@@ -200,15 +232,11 @@ func filesystemMonitor() {
 }
 
 // icecastSource extracts per-source fields from the parsed Icecast JSON.
-// Icecast returns "source" as either a single object or an array when
-// multiple mountpoints are active. We always pick the first active source
-// that matches our public stream URL (if configured), or simply the first one.
 func icecastSource(j *gabs.Container) *gabs.Container {
 	src := j.Path("icestats.source")
 	if src == nil {
 		return nil
 	}
-	// Array case: multiple mountpoints.
 	if children, err := src.Children(); err == nil && len(children) > 0 {
 		if c.PublicStreamURL != "" {
 			for _, child := range children {
@@ -219,10 +247,8 @@ func icecastSource(j *gabs.Container) *gabs.Container {
 				}
 			}
 		}
-		// No match — return first active source.
 		return children[0]
 	}
-	// Single object case.
 	return src
 }
 
@@ -255,7 +281,8 @@ func icecastMonitor() {
 			reset()
 			return
 		}
-		body, err := io.ReadAll(resp.Body)
+		// Limit Icecast body to 1 MB — status JSON should be tiny.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
 		if err != nil {
 			slog.Warn("Icecast body read error.", "error", err)
 			reset()
@@ -283,6 +310,7 @@ func icecastMonitor() {
 			return
 		}
 
+		// Capture the full snapshot under a single write lock.
 		nowMu.Lock()
 		now.Song.Artist = artistVal
 		now.Song.Title = titleVal
@@ -292,16 +320,16 @@ func icecastMonitor() {
 		if m, ok := src.Path("server_name").Data().(string); ok {
 			now.Mountpoint = m
 		}
-		// listeners is a JSON number; gabs decodes all numbers as float64.
 		if l, ok := src.Path("listeners").Data().(float64); ok {
 			now.Listeners = int64(l)
 		}
 		if b, ok := src.Path("bitrate").Data().(float64); ok {
 			now.Bitrate = b
 		}
+		// Take the snapshot while still holding the write lock to avoid a
+		// second lock acquisition immediately after Unlock().
+		nowSnap := now
 		nowMu.Unlock()
-
-		nowSnap := NowSnapshot()
 
 		if prev.Song.Title != nowSnap.Song.Title || prev.Song.Artist != nowSnap.Song.Artist {
 			slog.Info("Now playing changed.",
@@ -316,8 +344,6 @@ func icecastMonitor() {
 			}
 			radiodata_sse.SendEventMessage(nowSnap.Song.Title, "title", "")
 			radiodata_sse.SendEventMessage(nowSnap.Song.Artist, "artist", "")
-			// Only record to history when the previous track was a real song
-			// (not the idle sentinel "-" for either title or artist).
 			if prev.Song.Title != "" && prev.Song.Title != "-" &&
 				prev.Song.Artist != "" && prev.Song.Artist != "-" {
 				historyMu.Lock()
@@ -335,9 +361,6 @@ func icecastMonitor() {
 			}
 		}
 
-		// Use the shared buildPublicStream helper (defined in api.go) to build
-		// the public stream URL. This avoids duplicating the double-slash trim
-		// logic that previously existed inline here.
 		publicStream := buildPublicStream(nowSnap.Host, nowSnap.Mountpoint)
 		if prev.Host != nowSnap.Host || prev.Mountpoint != nowSnap.Mountpoint {
 			radiodata_sse.SendEventMessage(publicStream, "listenurl", "")
@@ -353,8 +376,6 @@ func icecastMonitor() {
 	}
 
 	slog.Info("Icecast monitor started.", "url", c.IcecastStatusURL, "poll", c.IcecastPollInterval)
-	// Use a Ticker so poll interval is wall-clock accurate regardless of
-	// how long check() takes. time.Sleep would drift when Icecast is slow.
 	ticker := time.NewTicker(c.IcecastPollInterval)
 	defer ticker.Stop()
 	for range ticker.C {

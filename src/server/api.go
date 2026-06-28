@@ -6,19 +6,46 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/dhowden/tag"
+	"golang.org/x/sync/singleflight"
 )
 
 // rescanRunning prevents overlapping rescans triggered by /api/admin/rescan,
 // SIGHUP, or the filesystem watcher.
 var rescanRunning atomic.Bool
+
+// artFlight deduplicates concurrent in-flight album-art requests for the
+// same song ID, preventing multiple goroutines opening and reading the same
+// audio file simultaneously.
+var artFlight singleflight.Group
+
+// dbPingCache avoids a real DB round-trip on every health-check request.
+// Refreshed by background goroutine every 10 s.
+var dbPingOK atomic.Bool
+
+func init() {
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			if dbActive != nil {
+				dbPingOK.Store(dbActive.Ping() == nil)
+			}
+		}
+	}()
+}
+
+// maxBodyBytes is the maximum request body size accepted by JSON handlers.
+// Guards against accidental or malicious oversized POST bodies.
+const maxBodyBytes = 512 * 1024 // 512 KB
 
 // streamIdle reports whether the icecast monitor has set sentinel "idle" values.
 func streamIdle(title, artist string) bool {
@@ -36,7 +63,7 @@ func buildPublicStream(host, mountpoint string) string {
 }
 
 // writeJSON encodes v as JSON into w, setting Content-Type and logging any
-// encode error. Callers must not write a status code before calling writeJSON.
+// encode error.
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
@@ -44,12 +71,40 @@ func writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+// decodeJSONBody decodes the request body into dst with a size limit.
+// Returns false and writes the appropriate error response on failure.
+func decodeJSONBody(w http.ResponseWriter, r *http.Request, dst any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		var maxErr *http.MaxBytesError
+		if err.Error() == "http: request body too large" || isMaxBytesError(err, &maxErr) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+		} else {
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		return false
+	}
+	return true
+}
+
+// isMaxBytesError checks whether err is from http.MaxBytesReader.
+func isMaxBytesError(err error, _ **http.MaxBytesError) bool {
+	return strings.Contains(err.Error(), "request body too large")
+}
+
 func Search() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Query string `json:"search"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if !decodeJSONBody(w, r, &req) {
+			return
+		}
+		// Reject empty queries explicitly — searchByQuery returns an error
+		// for empty strings, which would otherwise become a 500.
+		if strings.TrimSpace(req.Query) == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -69,8 +124,7 @@ func Search() http.HandlerFunc {
 func RequestID() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ ID string }
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		if !decodeJSONBody(w, r, &req) {
 			return
 		}
 		id, err := strconv.Atoi(req.ID)
@@ -94,7 +148,10 @@ func RequestID() http.HandlerFunc {
 func RequestBestMatch() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Search string }
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if !decodeJSONBody(w, r, &req) {
+			return
+		}
+		if strings.TrimSpace(req.Search) == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -119,7 +176,6 @@ func RequestBestMatch() http.HandlerFunc {
 func NowPlayingMetadata() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
-		// Guard: stream is idle or icecast unreachable.
 		if streamIdle(n.Song.Title, n.Song.Artist) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -140,7 +196,6 @@ func NowPlayingMetadata() http.HandlerFunc {
 func NowPlayingAlbumArt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
-		// Guard: stream is idle or icecast unreachable.
 		if streamIdle(n.Song.Title, n.Song.Artist) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
@@ -153,58 +208,78 @@ func NowPlayingAlbumArt() http.HandlerFunc {
 		song := results[0]
 		cacheKey := fmt.Sprintf("%d", song.ID)
 
+		// Fast path: cache hit.
 		if cached, ok := artCache.Load(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write(cached.([]byte))
 			return
 		}
 
-		path, err := getPathById(song.ID)
-		if err != nil {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		// 1. Try embedded tags — scoped in a closure so defer fires immediately.
-		var encoded string
-		func() {
-			f, ferr := os.Open(path)
-			if ferr != nil {
-				return
+		// Slow path: deduplicate concurrent requests for the same song via
+		// singleflight. Only one goroutine opens the file; others wait and
+		// share the result.
+		v, err, _ := artFlight.Do(cacheKey, func() (interface{}, error) {
+			// Double-check cache after acquiring the flight slot.
+			if cached, ok := artCache.Load(cacheKey); ok {
+				return cached.([]byte), nil
 			}
-			defer f.Close()
-			tags, terr := tag.ReadFrom(f)
-			if terr == nil && tags.Picture() != nil {
-				encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
-			}
-		}()
 
-		// 2. Fallback: cover.jpg / folder.jpg in the same directory.
-		if encoded == "" {
-			if fallbackPath := ArtworkPath(path); fallbackPath != "" {
-				if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
-					encoded = base64.StdEncoding.EncodeToString(data)
-					slog.Debug("Artwork from fallback file.", "path", fallbackPath)
+			path, pathErr := getPathById(song.ID)
+			if pathErr != nil {
+				return nil, pathErr
+			}
+
+			var encoded string
+
+			// 1. Embedded tag art.
+			func() {
+				f, ferr := os.Open(path)
+				if ferr != nil {
+					return
+				}
+				defer f.Close()
+				// Limit tag read to 64 MB to avoid unbounded memory on corrupt files.
+				tags, terr := tag.ReadFrom(io.LimitReader(f, 64*1024*1024))
+				if terr == nil && tags.Picture() != nil {
+					encoded = base64.StdEncoding.EncodeToString(tags.Picture().Data)
+				}
+			}()
+
+			// 2. Fallback: cover.jpg / folder.jpg in the same directory.
+			if encoded == "" {
+				if fallbackPath := ArtworkPath(path); fallbackPath != "" {
+					if data, ferr := os.ReadFile(fallbackPath); ferr == nil {
+						encoded = base64.StdEncoding.EncodeToString(data)
+						slog.Debug("Artwork from fallback file.", "path", fallbackPath)
+					}
 				}
 			}
-		}
 
-		if encoded == "" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+			if encoded == "" {
+				return nil, nil // signals 204 No Content
+			}
 
-		type ArtResponse struct {
-			Picture string `json:"Picture"`
-		}
-		jsonBytes, merr := json.Marshal(ArtResponse{Picture: encoded})
-		if merr != nil {
+			type ArtResponse struct {
+				Picture string `json:"Picture"`
+			}
+			jsonBytes, merr := json.Marshal(ArtResponse{Picture: encoded})
+			if merr != nil {
+				return nil, merr
+			}
+			artCache.Store(cacheKey, jsonBytes)
+			return jsonBytes, nil
+		})
+
+		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		artCache.Store(cacheKey, jsonBytes)
+		if v == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(jsonBytes)
+		_, _ = w.Write(v.([]byte))
 	}
 }
 
@@ -214,7 +289,6 @@ func History() http.HandlerFunc {
 		snap := make([]playRecord, len(history))
 		copy(snap, history)
 		historyMu.Unlock()
-		// Always return an array, never JSON null.
 		if snap == nil {
 			snap = []playRecord{}
 		}
@@ -225,8 +299,6 @@ func History() http.HandlerFunc {
 func ListenURL() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
-		// buildPublicStream trims slashes to prevent double-slash when
-		// Icecast host ends with "/" or mountpoint starts with "/".
 		publicURL := buildPublicStream(n.Host, n.Mountpoint)
 		writeJSON(w, struct{ ListenURL string }{ListenURL: publicURL})
 	}
@@ -236,7 +308,6 @@ func Listeners() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n := NowSnapshot()
 		listeners := n.Listeners
-		// -1 sentinel means icecast unreachable; report 0 to the client.
 		if listeners < 0 {
 			listeners = 0
 		}
@@ -258,7 +329,6 @@ func Version() http.HandlerFunc {
 }
 
 // AdminRescan triggers a DB rescan. Only registered when CSERVER_DEVMODE=true.
-// Returns 202 immediately; 409 if a rescan is already in progress.
 func AdminRescan() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -284,7 +354,8 @@ func AdminRescan() http.HandlerFunc {
 
 func Readyz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if dbActive == nil || dbActive.Ping() != nil {
+		// Use the cached ping result to avoid a DB round-trip on every probe.
+		if dbActive == nil || !dbPingOK.Load() {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -294,7 +365,7 @@ func Readyz() http.HandlerFunc {
 
 func Healthz() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		dbOK := dbActive != nil && dbActive.Ping() == nil
+		dbOK := dbActive != nil && dbPingOK.Load()
 		n := NowSnapshot()
 		icecastOK := !streamIdle(n.Song.Title, n.Song.Artist)
 		status := "ok"
