@@ -17,6 +17,7 @@ COLOR_GREEN='\033[0;32m'
 COLOR_YELLOW='\033[1;33m'
 COLOR_RED='\033[0;31m'
 COLOR_CYAN='\033[0;36m'
+COLOR_BOLD='\033[1m'
 COLOR_RESET='\033[0m'
 
 info()  { echo -e "${COLOR_GREEN}[cadence]${COLOR_RESET} $*"; }
@@ -84,6 +85,7 @@ PG_PASS=""
 PG_DB="cadence"
 PG_TABLE="metadata"
 PG_SSL="disable"
+REMOVE_PG_SERVICE=false
 
 if [ "$DB_BACKEND" = "postgres" ]; then
   echo
@@ -120,16 +122,6 @@ if [ "$DB_BACKEND" = "postgres" ]; then
     read -rp  "SSL mode [disable]: " PG_SSL
     PG_SSL=${PG_SSL:-disable}
 
-    # Warn about fuzzystrmatch requirement
-    echo
-    warn "Cadence requires the 'fuzzystrmatch' extension for fuzzy search."
-    warn "The cadence server will attempt: CREATE EXTENSION IF NOT EXISTS fuzzystrmatch"
-    warn "This requires CREATE privilege on the database OR superuser."
-    warn "If your user lacks that, run this manually as a superuser first:"
-    warn "  psql -U postgres -d ${PG_DB} -c 'CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;'"
-    echo
-
-    # Remove the postgres service from compose (we don't want to deploy it)
     REMOVE_PG_SERVICE=true
 
   else
@@ -137,16 +129,54 @@ if [ "$DB_BACKEND" = "postgres" ]; then
     PG_DEPLOY_NEW=true
     PG_HOST="cadence-postgres"
     PG_PORT="5432"
-    PG_USER="postgres"
+    PG_USER="cadence_user"
     PG_DB="cadence"
     PG_TABLE="metadata"
     PG_SSL="disable"
 
-    read -rsp "Postgres password: " PG_PASS; echo
+    read -rsp "Postgres password for cadence_user: " PG_PASS; echo
     [ -z "$PG_PASS" ] && { err "Postgres password cannot be empty."; exit 1; }
 
     REMOVE_PG_SERVICE=false
   fi
+
+  # -----------------------------------------------------------------------
+  # Print setup SQL — shown right after all pg questions, before continuing
+  # -----------------------------------------------------------------------
+  echo
+  echo -e "${COLOR_BOLD}------------------------------------------------------------${COLOR_RESET}"
+  echo -e "${COLOR_BOLD} Postgres setup SQL — run these as a superuser (postgres)${COLOR_RESET}"
+  echo -e "${COLOR_BOLD}------------------------------------------------------------${COLOR_RESET}"
+  echo
+  if [ "$PG_SETUP_CHOICE" = "2" ]; then
+    echo "  # Connect to your existing instance first, e.g.:"
+    echo "  # psql -h ${PG_HOST} -p ${PG_PORT} -U postgres"
+  else
+    echo "  # Start the stack first, then connect to the new container:"
+    echo "  # docker exec -it cadence-postgres psql -U postgres"
+  fi
+  echo
+  cat <<SQL
+  -- 1. Create the application user
+  CREATE USER ${PG_USER} WITH PASSWORD '${PG_PASS}';
+
+  -- 2. Create the database owned by that user
+  CREATE DATABASE ${PG_DB} OWNER ${PG_USER};
+
+  -- 3. Connect to the new database and enable fuzzy search
+  \c ${PG_DB}
+  CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;
+
+  -- 4. Grant the user everything Cadence needs
+  GRANT CONNECT ON DATABASE ${PG_DB} TO ${PG_USER};
+  GRANT USAGE, CREATE ON SCHEMA public TO ${PG_USER};
+SQL
+  echo
+  warn "The password above is shown in plaintext — clear your terminal history after running this."
+  echo -e "${COLOR_BOLD}------------------------------------------------------------${COLOR_RESET}"
+  echo
+  read -rp "Press ENTER once you have run the SQL above (or to skip and continue)..."
+  echo
 fi
 
 # -----------------------------------------------------------------------
@@ -188,13 +218,13 @@ sed_inplace "s|^#\{0,1\}\s*CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND
 sed_inplace "s|^#\{0,1\}\s*CSERVER_LOGLEVEL=.*|CSERVER_LOGLEVEL=${LOG_LEVEL}|"                config/cadence.env
 
 if [ "$DB_BACKEND" = "postgres" ]; then
-  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESADDRESS=.*|CSERVER_POSTGRESADDRESS=${PG_HOST}|"   config/cadence.env
-  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESPORT=.*|CSERVER_POSTGRESPORT=${PG_PORT}|"         config/cadence.env
-  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESUSER=.*|CSERVER_POSTGRESUSER=${PG_USER}|"         config/cadence.env
-  sed_inplace "s|^#\{0,1\}\s*POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"               config/cadence.env
-  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESDBNAME=.*|CSERVER_POSTGRESDBNAME=${PG_DB}|"       config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESADDRESS=.*|CSERVER_POSTGRESADDRESS=${PG_HOST}|"      config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESPORT=.*|CSERVER_POSTGRESPORT=${PG_PORT}|"            config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESUSER=.*|CSERVER_POSTGRESUSER=${PG_USER}|"            config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"                  config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESDBNAME=.*|CSERVER_POSTGRESDBNAME=${PG_DB}|"          config/cadence.env
   sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESTABLENAME=.*|CSERVER_POSTGRESTABLENAME=${PG_TABLE}|" config/cadence.env
-  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESSSL=.*|CSERVER_POSTGRESSSL=${PG_SSL}|"           config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESSSL=.*|CSERVER_POSTGRESSSL=${PG_SSL}|"              config/cadence.env
 fi
 
 [ -n "$ADMIN_TOKEN" ]   && sed_inplace "s|^#\{0,1\}\s*CSERVER_ADMIN_TOKEN=.*|CSERVER_ADMIN_TOKEN=${ADMIN_TOKEN}|"             config/cadence.env
@@ -229,12 +259,8 @@ if [ -n "$PUBLIC_STREAM" ]; then
 fi
 sed_inplace "s|CSERVER_LOGLEVEL:.*|CSERVER_LOGLEVEL: ${LOG_LEVEL}|" docker-compose.yml
 
-# If using existing postgres, comment out the postgres service block in compose
-# so Portainer doesn't try to start a container we don't need.
-if [ "$DB_BACKEND" = "postgres" ] && [ "${REMOVE_PG_SERVICE:-false}" = "true" ]; then
-  # Mark the postgres profile service as disabled by prepending a clear comment.
-  # The profiles: ["postgres"] block won't start unless --profile postgres is passed,
-  # but we add a comment for clarity.
+# If using existing postgres, add a comment above the postgres service block
+if [ "$DB_BACKEND" = "postgres" ] && [ "$REMOVE_PG_SERVICE" = "true" ]; then
   sed_inplace "/^  postgres:$/i\\  # EXTERNAL POSTGRES — service below is disabled; using ${PG_HOST}" docker-compose.yml
   info "Noted: postgres container service left in compose but profile-gated (won't start by default)."
 fi
@@ -284,20 +310,20 @@ echo
 echo "  3. Create data directories:"
 echo "       mkdir -p /srv/data/hdd_01/HOMELAB/cadence/data"
 
-if [ "$DB_BACKEND" = "postgres" ] && [ "${PG_DEPLOY_NEW}" = "false" ]; then
+if [ "$DB_BACKEND" = "postgres" ] && [ "$PG_DEPLOY_NEW" = "false" ]; then
   echo
   warn "Existing Postgres checklist:"
-  warn "  • User '${PG_USER}' must have CONNECT + CREATE TABLE privileges on '${PG_DB}'"
-  warn "  • 'fuzzystrmatch' extension must exist in '${PG_DB}' (or the user needs CREATE privilege):"
-  warn "      psql -U postgres -d ${PG_DB} -c 'CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;'"
-  warn "  • If using an external host, ensure the Cadence container can reach ${PG_HOST}:${PG_PORT}"
-  warn "      (add to services-net or expose port, depending on your setup)"
+  warn "  • User '${PG_USER}' must have CONNECT + CREATE TABLE + USAGE on schema public"
+  warn "  • 'fuzzystrmatch' extension must be installed in '${PG_DB}' (superuser required)"
+  warn "  • Cadence container must be able to reach ${PG_HOST}:${PG_PORT}"
 fi
 
-if [ "$DB_BACKEND" = "postgres" ] && [ "${PG_DEPLOY_NEW}" = "true" ]; then
+if [ "$DB_BACKEND" = "postgres" ] && [ "$PG_DEPLOY_NEW" = "true" ]; then
   echo
-  info "Postgres profile: add 'postgres' to COMPOSE_PROFILES in Portainer, or deploy the postgres"
-  info "service separately. The postgres service is profile-gated in docker-compose.yml."
+  info "New Postgres container: uses profile 'postgres' in docker-compose.yml."
+  info "Enable it in Portainer via COMPOSE_PROFILES=postgres, or add --profile postgres to compose up."
+  info "Run the setup SQL shown above once the container is up:"
+  info "  docker exec -it cadence-postgres psql -U postgres"
 fi
 
 echo
