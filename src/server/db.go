@@ -21,13 +21,24 @@ import (
 var dbActive *sql.DB
 
 var audioExtensions = map[string]bool{
-	".mp3": true, ".flac": true, ".ogg": true,
-	".m4a": true, ".opus": true, ".wav": true, ".aac": true,
+	".mp3":  true,
+	".flac": true,
+	".ogg":  true,
+	".m4a":  true,
+	".m4b":  true, // audiobook container, same as m4a
+	".opus": true,
+	".wav":  true,
+	".aac":  true,
+	".wma":  true,
+	".aiff": true,
+	".aif":  true,
+	".ape":  true,
 }
 
 var artworkFallbackNames = []string{
 	"cover.jpg", "cover.png", "folder.jpg", "folder.png",
 	"album.jpg", "album.png", "front.jpg", "front.png",
+	"thumb.jpg", "thumb.png", "thumbnail.jpg", "thumbnail.png",
 }
 
 var cleanupMu sync.RWMutex
@@ -38,6 +49,17 @@ var artistCleanupRe []*regexp.Regexp
 //
 //	"01 - ", "02. ", "003 ", "1) "
 var trackPrefixRe = regexp.MustCompile(`^\d{1,4}[\s.\-)]*[-–]?\s*`)
+
+// ytdlpIDRe matches the YouTube video ID suffix that yt-dlp appends:
+//		"--<11-char-id>."
+//		"__<11-char-id>."
+//		" (<11-char-id>)."
+// The ID is always 11 base64url characters.
+var ytdlpIDRe = regexp.MustCompile(`(?:--|__| \()[A-Za-z0-9_-]{11}\)?(?:\.[a-z0-9]+)?$`)
+
+// ytdlpSepRe matches yt-dlp's triple-dash playlist/track separator:
+//		"Playlist-Title---001-Track-Title"
+var ytdlpSepRe = regexp.MustCompile(`-{3,}`)
 
 func resetCleanupRe() {
 	cleanupMu.Lock()
@@ -140,19 +162,58 @@ func ArtworkPath(audioPath string) string {
 	return ""
 }
 
-// guessFromFilename extracts artist and title from "Artist - Title" patterns.
-// It first strips common leading track-number prefixes from the base name,
-// and only treats the left side as an artist when it looks like one
-// (non-numeric, at least 2 chars).
+// guessFromFilename extracts artist and title from the filename alone.
+//
+// Handles multiple naming conventions, in order of specificity:
+//
+//  1. yt-dlp playlist format:
+//     "Playlist-Title---NNN-Track-Title--<ytID>.mp3"
+//     → artist = playlist title (dashes→spaces), title = track title
+//
+//  2. "Artist - Title" (space-dash-space):
+//     "Pink Floyd - Comfortably Numb.flac"
+//
+//  3. Bare dash separator (no spaces):
+//     "ArtistName-TrackTitle.mp3" where both sides are non-numeric
+//
+//  4. Fallback: whole basename becomes the title, artist left empty.
 func guessFromFilename(path string) (artist, title string) {
 	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+
+	// ── 1. yt-dlp playlist format ──────────────────────────────────────────
+	// Strip trailing YouTube ID ("--uMvFjbDAFbU" or "__uMvFjbDAFbU").
+	base = ytdlpIDRe.ReplaceAllString(base, "")
+	base = strings.TrimRight(base, "-_ ")
+
+	// Detect triple-dash separator: "Playlist---NNN-Track-Title"
+	if ytdlpSepRe.MatchString(base) {
+		parts := ytdlpSepRe.Split(base, 2)
+		playlist := dashesToSpaces(parts[0])
+		trackPart := ""
+		if len(parts) == 2 {
+			trackPart = parts[1]
+			// Strip leading track number from the track part ("005-track-title" → "track-title")
+			trackPart = trackPrefixRe.ReplaceAllString(trackPart, "")
+			trackPart = strings.TrimLeft(trackPart, "-")
+			trackPart = dashesToSpaces(trackPart)
+		}
+		if trackPart == "" {
+			trackPart = playlist
+			playlist = ""
+		}
+		// Title-case the result so "the night has its own bandwidth" → readable.
+		return strings.TrimSpace(playlist), strings.TrimSpace(trackPart)
+	}
+
+	// Replace remaining separators for the simpler patterns below.
 	base = strings.ReplaceAll(base, "_-_", " - ")
 	base = strings.ReplaceAll(base, "_", " ")
 
+	// Strip leading track-number prefix.
 	stripped := trackPrefixRe.ReplaceAllString(base, "")
 
-	parts := strings.SplitN(stripped, " - ", 2)
-	if len(parts) == 2 {
+	// ── 2. "Artist - Title" (space-dash-space) ─────────────────────────────
+	if parts := strings.SplitN(stripped, " - ", 2); len(parts) == 2 {
 		left := strings.TrimSpace(parts[0])
 		right := strings.TrimSpace(parts[1])
 		if !isAllDigits(left) && left != "" {
@@ -160,7 +221,27 @@ func guessFromFilename(path string) (artist, title string) {
 		}
 		return "", right
 	}
+
+	// ── 3. Bare dash: "ArtistName-TrackTitle" ─────────────────────────────
+	// Only split if both sides are non-empty and neither is all-digits.
+	if parts := strings.SplitN(stripped, "-", 2); len(parts) == 2 {
+		left := strings.TrimSpace(parts[0])
+		right := strings.TrimSpace(parts[1])
+		if left != "" && right != "" && !isAllDigits(left) && !isAllDigits(right) {
+			return left, right
+		}
+	}
+
+	// ── 4. Fallback ────────────────────────────────────────────────────────
 	return "", strings.TrimSpace(stripped)
+}
+
+// dashesToSpaces converts hyphen-separated-words to space separated words.
+// Single dashes between words become spaces; runs of dashes become one space.
+func dashesToSpaces(s string) string {
+	// Replace any run of dashes/underscores with a single space.
+	re := regexp.MustCompile(`[-_]+`)
+	return strings.TrimSpace(re.ReplaceAllString(s, " "))
 }
 
 func isAllDigits(s string) bool {
@@ -276,15 +357,32 @@ func dbPopulate() error {
 	}
 
 	slog.Info("Walking music directory.", "dir", c().MusicDir)
+
+	// seen tracks real paths to avoid double-scanning symlinked dirs.
+	seen := make(map[string]struct{})
 	var files []string
 	err := filepath.Walk(c().MusicDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			slog.Warn("Walk error, skipping path.", "path", path, "error", err)
 			return nil
 		}
-		if !info.IsDir() && audioExtensions[strings.ToLower(filepath.Ext(path))] {
-			files = append(files, path)
+		if info.IsDir() {
+			return nil
 		}
+		if !audioExtensions[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+		// Resolve symlinks to deduplicate.
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			real = path // can't resolve; use as-is
+		}
+		if _, dup := seen[real]; dup {
+			slog.Debug("Skipping duplicate (symlink).", "path", path, "real", real)
+			return nil
+		}
+		seen[real] = struct{}{}
+		files = append(files, path)
 		return nil
 	})
 	if err != nil {
@@ -352,14 +450,14 @@ func dbPopulate() error {
 //
 // Priority (lowest → highest; each layer only fills empty slots):
 //
-//	1. filename guess        — always available, weakest signal
-//	2. yt-dlp sidecar       — enriches fields the embedded tags left blank
-//	3. embedded tags        — strongest signal; wins over sidecar when present
+//  1. filename guess        — always available, weakest signal
+//  2. yt-dlp sidecar       — enriches fields the embedded tags left blank
+//  3. embedded tags        — strongest signal; wins over sidecar when present
 //
 // The sidecar is intentionally loaded before opening the audio file so
 // that the tag-library parse (step 3) always has the last word.
 func extractTags(path string) (title, album, artist, genre, year string) {
-	// ── Step 1: filename guess ──────────────────────────────────────────────
+	// ── Step 1: filename guess ───────────────────────────────────────────────────────
 	guessArtist, guessTitle := guessFromFilename(path)
 	basenameFallback := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
 	title = sanitize(cleanTitle(guessTitle), basenameFallback)
@@ -368,9 +466,7 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 	genre = ""
 	year = ""
 
-	// ── Step 2: yt-dlp sidecar ──────────────────────────────────────────────
-	// Only fills fields that are still at their default values.
-	// Embedded tags (step 3) will override anything set here.
+	// ── Step 2: yt-dlp sidecar ────────────────────────────────────────────────────
 	if info := loadYTDLPInfo(path); info != nil {
 		if s := sanitize(cleanTitle(info.BestTitle()), ""); s != "" {
 			title = s
@@ -389,7 +485,7 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 		}
 	}
 
-	// ── Step 3: embedded tags ───────────────────────────────────────────────
+	// ── Step 3: embedded tags ─────────────────────────────────────────────────────
 	f, err := os.Open(path)
 	if err != nil {
 		slog.Warn("Cannot open file for tag read.", "path", path, "error", err)
@@ -413,24 +509,20 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 		title = sanitize(cleaned, raw)
 	}
 
-	// Artist: embedded tag > non-standard raw frames > sidecar > filename.
-	// We only check raw frames when the standard accessor returns empty,
-	// because yt-dlp sometimes writes uploader into non-standard Vorbis tags.
+	// Artist: embedded TPE1 > raw non-standard frames (album artist / TPE2) > sidecar > filename.
 	if raw := sanitize(tags.Artist(), ""); raw != "" {
 		cleaned := cleanArtist(raw)
 		artist = sanitize(cleaned, raw)
 	} else if rawMap := tags.Raw(); rawMap != nil {
-		// Non-standard frames that yt-dlp embeds when the video has a
-		// proper artist tag in a non-standard slot.
+		// Only check album-artist frames — not ARTIST/artist which tags.Artist()
+		// already tried. This avoids clobbering the sidecar artist with
+		// "Various Artists" from compilation tags unnecessarily.
 		if s := sanitize(cleanArtist(rawTagString(rawMap,
-			"ARTIST", "artist",             // Vorbis standard (already tried above via tags.Artist)
-			"album_artist", "ALBUM_ARTIST", // fallback: album artist
-			"TPE2",                          // ID3v2 album artist
+			"album_artist", "ALBUM_ARTIST",
+			"TPE2",
 		)), ""); s != "" {
 			artist = s
 		}
-		// Sidecar uploader/channel is already in `artist` from step 2;
-		// only overwrite if we found something better in raw frames.
 	}
 
 	// Album: embedded tag beats sidecar (playlist name).
@@ -443,7 +535,7 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 		genre = raw
 	}
 
-	// Year: prefer embedded numeric year; fall through raw map; sidecar last.
+	// Year: prefer embedded numeric year; fall through raw map; sidecar fills gap.
 	if y := tags.Year(); y > 0 {
 		year = fmt.Sprintf("%d", y)
 	} else if rawMap := tags.Raw(); rawMap != nil {
@@ -451,8 +543,6 @@ func extractTags(path string) (title, album, artist, genre, year string) {
 			year = s
 		}
 	}
-	// Sidecar year fills the gap only if nothing embedded was found.
-	// (already set in step 2; leave it unless the embedded tag had something)
 
 	return
 }
@@ -463,7 +553,7 @@ func extractRawYear(raw map[string]interface{}) string {
 	candidates := []string{
 		"YEAR", "year",
 		"DATE", "date",
-		"TDRC", "tdrc", // ID3v2.4 recording time
+		"TDRC", "tdrc", // ID3v2.4 recording time (may be "YYYY-MM-DD")
 		"TYER", "tyer", // ID3v2.3 year
 		"©day",    // MP4 / iTunes
 		"WM/Year", // ASF / WMA
@@ -477,10 +567,12 @@ func extractRawYear(raw map[string]interface{}) string {
 		if s == "" || s == "0" || s == "<nil>" {
 			continue
 		}
+		// Timestamps like "2023-07-15" or "20230715" — take first 4 chars.
 		if len(s) >= 4 {
 			s = s[:4]
 		}
-		if isAllDigits(s) {
+		// Require exactly 4 digits to avoid storing malformed partials.
+		if len(s) == 4 && isAllDigits(s) {
 			return s
 		}
 	}
