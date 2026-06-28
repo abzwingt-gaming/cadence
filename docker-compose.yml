@@ -1,15 +1,15 @@
 # Cadence docker-compose — Portainer-ready
 #
-# Images are pre-built locally by install.sh (docker build).
-# Copy this file into Portainer as a Stack — no source checkout needed.
+# Images are pre-built locally by install.sh.
+# No build: blocks — copy this file into Portainer as a Stack.
 #
 # Profiles:
 #   (none)    — cadence + icecast + liquidsoap + SQLite
-#   postgres  — adds postgres, set CSERVER_DB_BACKEND=postgres in cadence.env
+#   postgres  — adds postgres service
 #   redis     — adds redis for rate limiting
 #
-# Required env vars (set in Portainer Stack → Environment variables):
-#   HOST_MUSIC_DIR   — absolute path on Docker host, e.g. /srv/data/music
+# Set in Portainer Stack → Environment variables:
+#   HOST_MUSIC_DIR   absolute path on Docker host, e.g. /srv/data/music
 
 services:
 
@@ -54,8 +54,50 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    env_file:
-      - /srv/ssd/HOMELAB/cadence/config/cadence.env
+    environment:
+      # General
+      CSERVER_PORT: "8080"
+      CSERVER_ROOTPATH: /app/public/
+      CSERVER_MUSIC_DIR: /music
+      CSERVER_LOGLEVEL: info
+      CSERVER_DEVMODE: "false"
+      CSERVER_HISTORY_SIZE: "10"
+      # Scan
+      CSERVER_SCAN_WORKERS: "4"
+      CSERVER_FSNOTIFY_DEBOUNCE_MS: "3000"
+      # Icecast
+      CSERVER_ICECAST_STATUS_URL: http://icecast2:8000
+      CSERVER_ICECAST_POLL_INTERVAL_MS: "1000"
+      CSERVER_PUBLIC_STREAM_URL: ""   # e.g. https://radio.lan.zedzulmeng.online
+      # Liquidsoap
+      CSERVER_LIQUIDSOAPADDRESS: liquidsoap
+      CSERVER_LIQUIDSOAPPORT: "1234"
+      CSERVER_LIQUIDSOAP_HTTP_PORT: "8001"
+      CSERVER_LIQUIDSOAP_MODE: auto
+      CSERVER_LIQUIDSOAP_TIMEOUT_MS: "5000"
+      # Rate limiting (keep false behind Caddy — use Caddy rate_limit instead)
+      CSERVER_RATELIMIT_ENABLED: "false"
+      CSERVER_REAL_IP_HEADER: X-Forwarded-For
+      CSERVER_TRUSTED_PROXY: ""
+      CSERVER_REQRATELIMIT: "5"
+      CSERVER_ART_RATELIMIT_MAX: "16"
+      CSERVER_ART_RATELIMIT_WINDOW_MS: "200000"
+      # Database
+      CSERVER_DB_BACKEND: sqlite          # change to postgres if using that profile
+      CSERVER_SQLITE_PATH: /data/cadence.db
+      # Postgres (only used when CSERVER_DB_BACKEND=postgres)
+      CSERVER_POSTGRESADDRESS: cadence-postgres
+      CSERVER_POSTGRESPORT: "5432"
+      CSERVER_POSTGRESUSER: postgres
+      POSTGRES_PASSWORD: changeme
+      CSERVER_POSTGRESDBNAME: cadence
+      CSERVER_POSTGRESTABLENAME: metadata
+      CSERVER_POSTGRESSSL: disable
+      # Redis (only used when CSERVER_RATELIMIT_ENABLED=true)
+      CSERVER_REDISADDRESS: cadence-redis
+      CSERVER_REDISPORT: "6379"
+      CSERVER_REDISPASSWORD: ""
+      CSERVER_REDISDB: "0"
     volumes:
       - ${HOST_MUSIC_DIR}:/music:ro
       - /srv/ssd/HOMELAB/cadence/custom.css:/app/public/css/custom.css:ro
@@ -87,14 +129,16 @@ services:
     restart: unless-stopped
     expose:
       - "5432"
-    env_file:
-      - /srv/ssd/HOMELAB/cadence/config/cadence.env
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: cadence
     volumes:
       - /srv/data/hdd_01/HOMELAB/cadence/postgres:/var/lib/postgresql/data
     networks:
       - services-net
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-cadence}"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cadence"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -104,26 +148,14 @@ services:
     image: redis:7-alpine
     container_name: cadence-redis
     restart: unless-stopped
-    command: >
-      sh -c '
-        if [ -n "$${REDIS_PASSWORD}" ]; then
-          exec redis-server --requirepass "$${REDIS_PASSWORD}" --save "" --appendonly no
-        else
-          exec redis-server --save "" --appendonly no
-        fi'
+    command: >-
+      redis-server --save "" --appendonly no
     expose:
       - "6379"
     networks:
       - services-net
     healthcheck:
-      test:
-        - "CMD-SHELL"
-        - |
-          if [ -n "${REDIS_PASSWORD:-}" ]; then
-            redis-cli -a "${REDIS_PASSWORD}" ping | grep -q PONG
-          else
-            redis-cli ping | grep -q PONG
-          fi
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 3
