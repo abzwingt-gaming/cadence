@@ -1,9 +1,12 @@
-// fs_monitor.go — watches the music directory and triggers a DB rescan on changes.
+// fs_monitor.go — watches the music directory (recursively) and triggers
+// a debounced DB rescan on any filesystem change.
 
 package main
 
 import (
+	"io/fs"
 	"log/slog"
+	"path/filepath"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -12,7 +15,7 @@ import (
 func filesystemMonitor() {
 	conf := c()
 	if conf.MusicDir == "" {
-		slog.Info("[fsmonitor] CSERVER_MUSIC_DIR not set, filesystem monitor disabled.")
+		slog.Info("[fsmonitor] CSERVER_MUSIC_DIR not set — filesystem monitor disabled.")
 		return
 	}
 
@@ -23,11 +26,31 @@ func filesystemMonitor() {
 	}
 	defer watcher.Close()
 
-	if err := watcher.Add(conf.MusicDir); err != nil {
-		slog.Error("[fsmonitor] Failed to watch music dir.", "dir", conf.MusicDir, "error", err)
+	// Watch the root and every subdirectory so new folders are caught.
+	var watched int
+	err = filepath.WalkDir(conf.MusicDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			slog.Warn("[fsmonitor] Walk error, skipping.", "path", path, "error", err)
+			return nil
+		}
+		if d.IsDir() {
+			if watchErr := watcher.Add(path); watchErr != nil {
+				slog.Warn("[fsmonitor] Failed to watch directory.", "path", path, "error", watchErr)
+			} else {
+				watched++
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Error("[fsmonitor] Failed to walk music dir.", "dir", conf.MusicDir, "error", err)
 		return
 	}
-	slog.Info("[fsmonitor] Watching music directory.", "dir", conf.MusicDir)
+	slog.Info("[fsmonitor] Watching music directory.",
+		"root", conf.MusicDir,
+		"dirs_watched", watched,
+		"debounce", conf.FsnotifyDebounce,
+	)
 
 	var debounce <-chan time.Time
 
@@ -35,30 +58,32 @@ func filesystemMonitor() {
 		select {
 		case event, ok := <-watcher.Events:
 			if !ok {
+				slog.Warn("[fsmonitor] Events channel closed, monitor exiting.")
 				return
 			}
-			slog.Debug("[fsmonitor] FS event.", "op", event.Op, "name", event.Name)
+			slog.Debug("[fsmonitor] Event.", "op", event.Op, "name", event.Name)
 			debounce = time.After(c().FsnotifyDebounce)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
+				slog.Warn("[fsmonitor] Errors channel closed, monitor exiting.")
 				return
 			}
 			slog.Warn("[fsmonitor] Watcher error.", "error", err)
 
 		case <-debounce:
-			if sighupReloading.CompareAndSwap(false, true) {
-				go func() {
-					defer sighupReloading.Store(false)
-					slog.Info("[fsmonitor] Change detected, rescanning library.")
-					if err := dbPopulate(); err != nil {
-						slog.Error("[fsmonitor] Rescan failed.", "error", err)
-					}
-				}()
-			} else {
-				slog.Debug("[fsmonitor] Rescan already in progress, skipping.")
-			}
 			debounce = nil
+			if !sighupReloading.CompareAndSwap(false, true) {
+				slog.Debug("[fsmonitor] Rescan already in progress, skipping.")
+				continue
+			}
+			go func() {
+				defer sighupReloading.Store(false)
+				slog.Info("[fsmonitor] Change detected, rescanning library.")
+				if err := dbPopulate(); err != nil {
+					slog.Error("[fsmonitor] Rescan failed.", "error", err)
+				}
+			}()
 		}
 	}
 }

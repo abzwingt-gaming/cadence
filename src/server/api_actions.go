@@ -15,9 +15,8 @@ import (
 	"time"
 )
 
-// liquidsoapClient is a package-level http.Client with connection pooling.
-// Creating a new http.Client per request exhausts file descriptors under load.
-// Initialised once via initLiquidsoapClient() called from main().
+// liquidsoapClient is a shared http.Client with connection pooling.
+// Allocated once via initLiquidsoapClient() from main().
 var liquidsoapClient *http.Client
 
 func initLiquidsoapClient() {
@@ -90,7 +89,8 @@ func getNowPlaying() nowPlayingData {
 }
 
 // buildPublicStream returns the stream URL clients should connect to.
-// Priority: CSERVER_PUBLIC_STREAM_URL (Caddy/CDN URL) -> Icecast listenurl host + path.
+// Prefers CSERVER_PUBLIC_STREAM_URL when set (Caddy/CDN front), otherwise
+// assembles from the Icecast listenurl.
 func buildPublicStream(icecastBase, mountpath string) string {
 	if pu := c().PublicStreamURL; pu != "" {
 		return strings.TrimRight(pu, "/") + mountpath
@@ -104,108 +104,131 @@ func icecastMonitor() {
 	ticker := time.NewTicker(c().IcecastPollInterval)
 	defer ticker.Stop()
 	statusURL := c().IcecastStatusURL + "/status-json.xsl"
+	slog.Info("Icecast monitor started.", "url", statusURL, "interval", c().IcecastPollInterval)
 
 	for range ticker.C {
-		func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				slog.Debug("Icecast poll failed.", "error", err)
-				return
-			}
-			defer resp.Body.Close()
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-
-			var raw map[string]interface{}
-			if json.Unmarshal(body, &raw) != nil {
-				return
-			}
-			icestats, _ := raw["icestats"].(map[string]interface{})
-			if icestats == nil {
-				return
-			}
-
-			var sources []map[string]interface{}
-			switch v := icestats["source"].(type) {
-			case map[string]interface{}:
-				sources = []map[string]interface{}{v}
-			case []interface{}:
-				for _, s := range v {
-					if m, ok := s.(map[string]interface{}); ok {
-						sources = append(sources, m)
-					}
-				}
-			}
-			if len(sources) == 0 {
-				return
-			}
-			src := sources[0]
-
-			nd := nowPlayingData{}
-			if t, ok := src["title"].(string); ok {
-				nd.Title = t
-			}
-			if a, ok := src["artist"].(string); ok {
-				nd.Artist = a
-			}
-			if l, ok := src["listeners"].(float64); ok {
-				nd.Listeners = int(l)
-			}
-			if b, ok := src["bitrate"].(float64); ok {
-				nd.Bitrate = int(b)
-			}
-
-			// Extract mountpoint from listenurl path, not server_name.
-			if lu, ok := src["listenurl"].(string); ok && lu != "" {
-				if u, err := url.Parse(lu); err == nil && u.Path != "" {
-					nd.Mountpoint = buildPublicStream(c().IcecastStatusURL, u.Path)
-				}
-			}
-			if nd.Mountpoint == "" {
-				if sn, ok := src["server_name"].(string); ok && sn != "" {
-					nd.Mountpoint = buildPublicStream(c().IcecastStatusURL, "/"+strings.TrimPrefix(sn, "/"))
-				}
-			}
-
-			nowMu.Lock()
-			prev := nowPlaying
-			nowPlaying = nd
-			nowMu.Unlock()
-
-			if nd.Title != prev.Title || nd.Artist != prev.Artist {
-				historyPush(nd.Title, nd.Artist)
-				inMemoryArtCacheClear()
-				artCacheClear()
-				sseNotify(nd)
-				slog.Info("Now playing.", "title", nd.Title, "artist", nd.Artist)
-			}
-		}()
+		if err := pollIcecast(statusURL); err != nil {
+			slog.Debug("Icecast poll failed.", "error", err)
+		}
 	}
 }
 
-// ── Liquidsoap request ────────────────────────────────────────────────────────
+func pollIcecast(statusURL string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL, nil)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP GET: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d from Icecast", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+
+	var raw struct {
+		Icestats struct {
+			Source json.RawMessage `json:"source"`
+		} `json:"icestats"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("JSON unmarshal: %w", err)
+	}
+
+	// Source can be a single object or an array — handle both.
+	var sources []map[string]interface{}
+	var single map[string]interface{}
+	if json.Unmarshal(raw.Icestats.Source, &single) == nil {
+		sources = []map[string]interface{}{single}
+	} else {
+		if err := json.Unmarshal(raw.Icestats.Source, &sources); err != nil {
+			return fmt.Errorf("parse sources: %w", err)
+		}
+	}
+	if len(sources) == 0 {
+		return fmt.Errorf("no active Icecast sources")
+	}
+	src := sources[0]
+
+	nd := nowPlayingData{}
+	if t, ok := src["title"].(string); ok {
+		nd.Title = t
+	}
+	if a, ok := src["artist"].(string); ok {
+		nd.Artist = a
+	}
+	if l, ok := src["listeners"].(float64); ok {
+		nd.Listeners = int(l)
+	}
+	if b, ok := src["bitrate"].(float64); ok {
+		nd.Bitrate = int(b)
+	}
+	if lu, ok := src["listenurl"].(string); ok && lu != "" {
+		if u, err := url.Parse(lu); err == nil && u.Path != "" {
+			nd.Mountpoint = buildPublicStream(c().IcecastStatusURL, u.Path)
+		}
+	}
+	if nd.Mountpoint == "" {
+		if sn, ok := src["server_name"].(string); ok && sn != "" {
+			nd.Mountpoint = buildPublicStream(c().IcecastStatusURL, "/"+strings.TrimPrefix(sn, "/"))
+		}
+	}
+
+	nowMu.Lock()
+	prev := nowPlaying
+	nowPlaying = nd
+	nowMu.Unlock()
+
+	if nd.Title != prev.Title || nd.Artist != prev.Artist {
+		slog.Info("Now playing changed.",
+			"title", nd.Title,
+			"artist", nd.Artist,
+			"listeners", nd.Listeners,
+		)
+		historyPush(nd.Title, nd.Artist)
+		inMemoryArtCacheClear()
+		artCacheClear()
+		sseNotify(nd)
+	}
+	if nd.Listeners != prev.Listeners {
+		slog.Debug("Listener count changed.", "listeners", nd.Listeners)
+	}
+	return nil
+}
+
+// ── Liquidsoap HTTP request ───────────────────────────────────────────────────
 
 func liquidsoapHTTP(path string) error {
 	if liquidsoapClient == nil {
 		initLiquidsoapClient()
 	}
 	rawURL := fmt.Sprintf("http://%s:%s/%s",
-		c().LiquidsoapAddress, c().LiquidsoapHTTPPort, strings.TrimPrefix(path, "/"))
+		c().LiquidsoapAddress, c().LiquidsoapHTTPPort,
+		strings.TrimPrefix(path, "/"))
 	ctx, cancel := context.WithTimeout(context.Background(), c().LiquidsoapTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("liquidsoap HTTP build request path=%q: %w", path, err)
 	}
 	resp, err := liquidsoapClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("liquidsoap HTTP %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body) // drain so connection is reused
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("liquidsoap returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("liquidsoap HTTP %s returned %d", rawURL, resp.StatusCode)
 	}
 	return nil
 }

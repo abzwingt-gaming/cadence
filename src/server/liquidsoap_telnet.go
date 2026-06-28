@@ -1,5 +1,5 @@
 // liquidsoap_telnet.go — telnet protocol client for Liquidsoap.
-// Used when CSERVER_LIQUIDSOAP_MODE != "http" (default).
+// Used when CSERVER_LIQUIDSOAP_MODE != "http".
 
 package main
 
@@ -12,32 +12,40 @@ import (
 	"time"
 )
 
+// liquidsoapTelnet opens a TCP connection to Liquidsoap's telnet port,
+// sends cmd, and reads the response until the "END" sentinel line.
+// Returns an error if the connection fails, the write fails, or the
+// server closes without sending "END".
 func liquidsoapTelnet(cmd string) error {
 	conf := c()
-	addr := conf.LiquidsoapAddress + ":" + conf.LiquidsoapPort
+	addr := net.JoinHostPort(conf.LiquidsoapAddress, conf.LiquidsoapPort)
+
 	conn, err := net.DialTimeout("tcp", addr, conf.LiquidsoapTimeout)
 	if err != nil {
 		return fmt.Errorf("liquidsoap telnet connect %s: %w", addr, err)
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(conf.LiquidsoapTimeout))
 
-	_, err = fmt.Fprintf(conn, "%s\n", strings.TrimSpace(cmd))
-	if err != nil {
-		return fmt.Errorf("liquidsoap telnet write: %w", err)
+	deadline := time.Now().Add(conf.LiquidsoapTimeout)
+	if err := conn.SetDeadline(deadline); err != nil {
+		return fmt.Errorf("liquidsoap telnet set deadline: %w", err)
 	}
 
-	// Read response until "END" sentinel or EOF.
+	if _, err := fmt.Fprintf(conn, "%s\n", strings.TrimSpace(cmd)); err != nil {
+		return fmt.Errorf("liquidsoap telnet write cmd=%q: %w", cmd, err)
+	}
+
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		line := scanner.Text()
+		slog.Debug("Liquidsoap telnet response.", "cmd", cmd, "line", line)
 		if line == "END" {
-			break
+			return nil
 		}
-		slog.Debug("Liquidsoap telnet response.", "line", line)
 	}
 	if err := scanner.Err(); err != nil {
-		slog.Warn("Liquidsoap telnet read error.", "cmd", cmd, "error", err)
+		return fmt.Errorf("liquidsoap telnet read cmd=%q: %w", cmd, err)
 	}
-	return nil
+	// EOF without END sentinel — treat as a protocol error.
+	return fmt.Errorf("liquidsoap telnet: connection closed without END sentinel (cmd=%q)", cmd)
 }
