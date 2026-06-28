@@ -52,7 +52,6 @@ info "=== Configuration ==="
 echo
 
 # HOST_MUSIC_DIR  — path on the Docker host, bind-mounted into containers as /music.
-# Containers always see music at /music; this is only used for the volume mount.
 read -rp "Music directory on this host [/srv/data/music]: " HOST_MUSIC_DIR
 HOST_MUSIC_DIR=${HOST_MUSIC_DIR:-/srv/data/music}
 
@@ -60,6 +59,9 @@ if [ ! -d "$HOST_MUSIC_DIR" ]; then
   warn "'$HOST_MUSIC_DIR' does not exist. Create it before starting containers."
 fi
 
+# -----------------------------------------------------------------------
+# Database backend
+# -----------------------------------------------------------------------
 echo
 echo "Database backend:"
 echo "  1) sqlite   - lightweight, single file, recommended for homelab"
@@ -71,12 +73,85 @@ case "$DB_CHOICE" in
   *) DB_BACKEND=sqlite   ;;
 esac
 
+# -----------------------------------------------------------------------
+# Postgres — deploy new vs. connect to existing
+# -----------------------------------------------------------------------
+PG_DEPLOY_NEW=false
+PG_HOST="cadence-postgres"
+PG_PORT="5432"
+PG_USER="postgres"
 PG_PASS=""
+PG_DB="cadence"
+PG_TABLE="metadata"
+PG_SSL="disable"
+
 if [ "$DB_BACKEND" = "postgres" ]; then
-  read -rsp "Postgres password: " PG_PASS; echo
-  [ -z "$PG_PASS" ] && { err "Postgres password cannot be empty."; exit 1; }
+  echo
+  echo "Postgres setup:"
+  echo "  1) Deploy a new Postgres container (managed by this stack)"
+  echo "  2) Connect to an existing Postgres instance"
+  read -rp "Choice [1]: " PG_SETUP_CHOICE
+  PG_SETUP_CHOICE=${PG_SETUP_CHOICE:-1}
+
+  if [ "$PG_SETUP_CHOICE" = "2" ]; then
+    # ---- existing postgres ----
+    echo
+    info "Connecting to existing Postgres."
+    echo
+    read -rp  "Host (IP or hostname) [localhost]: " PG_HOST
+    PG_HOST=${PG_HOST:-localhost}
+
+    read -rp  "Port [5432]: " PG_PORT
+    PG_PORT=${PG_PORT:-5432}
+
+    read -rp  "Database name [cadence]: " PG_DB
+    PG_DB=${PG_DB:-cadence}
+
+    read -rp  "Username [cadence_user]: " PG_USER
+    PG_USER=${PG_USER:-cadence_user}
+
+    read -rsp "Password: " PG_PASS; echo
+    [ -z "$PG_PASS" ] && { err "Postgres password cannot be empty."; exit 1; }
+
+    read -rp  "Table name [metadata]: " PG_TABLE
+    PG_TABLE=${PG_TABLE:-metadata}
+
+    echo "SSL mode options: disable | require | verify-ca | verify-full"
+    read -rp  "SSL mode [disable]: " PG_SSL
+    PG_SSL=${PG_SSL:-disable}
+
+    # Warn about fuzzystrmatch requirement
+    echo
+    warn "Cadence requires the 'fuzzystrmatch' extension for fuzzy search."
+    warn "The cadence server will attempt: CREATE EXTENSION IF NOT EXISTS fuzzystrmatch"
+    warn "This requires CREATE privilege on the database OR superuser."
+    warn "If your user lacks that, run this manually as a superuser first:"
+    warn "  psql -U postgres -d ${PG_DB} -c 'CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;'"
+    echo
+
+    # Remove the postgres service from compose (we don't want to deploy it)
+    REMOVE_PG_SERVICE=true
+
+  else
+    # ---- new postgres container ----
+    PG_DEPLOY_NEW=true
+    PG_HOST="cadence-postgres"
+    PG_PORT="5432"
+    PG_USER="postgres"
+    PG_DB="cadence"
+    PG_TABLE="metadata"
+    PG_SSL="disable"
+
+    read -rsp "Postgres password: " PG_PASS; echo
+    [ -z "$PG_PASS" ] && { err "Postgres password cannot be empty."; exit 1; }
+
+    REMOVE_PG_SERVICE=false
+  fi
 fi
 
+# -----------------------------------------------------------------------
+# Redis
+# -----------------------------------------------------------------------
 echo
 read -rp "Enable Redis rate limiting? (y/N): " USE_REDIS
 USE_REDIS=${USE_REDIS:-n}
@@ -85,18 +160,21 @@ if [[ "$USE_REDIS" =~ ^[Yy]$ ]]; then
   read -rsp "Redis password (leave blank for none): " REDIS_PASS; echo
 fi
 
+# -----------------------------------------------------------------------
+# Misc
+# -----------------------------------------------------------------------
 echo
-read -rp "Public stream URL (e.g. https://radio.lan.example.com/cadence1) [leave blank]: " PUBLIC_STREAM
+read -rp "Admin token for /api/admin/rescan (leave blank to disable): " ADMIN_TOKEN
+ADMIN_TOKEN=${ADMIN_TOKEN:-}
+
+read -rp "Public stream URL (e.g. https://radio.lan.example.com) [leave blank]: " PUBLIC_STREAM
 PUBLIC_STREAM=${PUBLIC_STREAM:-}
 
-echo
 read -rp "Log level (debug/info/warn/error) [info]: " LOG_LEVEL
 LOG_LEVEL=${LOG_LEVEL:-info}
 
 # -----------------------------------------------------------------------
 # Patch config files
-# CSERVER_MUSIC_DIR and liquidsoap.liq always get /music (container path).
-# HOST_MUSIC_DIR only goes into docker-compose.yml as the volume source.
 # -----------------------------------------------------------------------
 CONTAINER_MUSIC="/music"
 
@@ -104,28 +182,67 @@ sed_inplace() {
   sed -i.bak "$1" "$2" && rm -f "$2.bak"
 }
 
-sed_inplace "s|^#\{0,1\}\s*CSERVER_MUSIC_DIR=.*|CSERVER_MUSIC_DIR=${CONTAINER_MUSIC}|"  config/cadence.env
-sed_inplace "s|^#\{0,1\}\s*CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND}|"     config/cadence.env
-sed_inplace "s|^#\{0,1\}\s*CSERVER_LOGLEVEL=.*|CSERVER_LOGLEVEL=${LOG_LEVEL}|"           config/cadence.env
+# cadence.env patches
+sed_inplace "s|^#\{0,1\}\s*CSERVER_MUSIC_DIR=.*|CSERVER_MUSIC_DIR=${CONTAINER_MUSIC}|"      config/cadence.env
+sed_inplace "s|^#\{0,1\}\s*CSERVER_DB_BACKEND=.*|CSERVER_DB_BACKEND=${DB_BACKEND}|"          config/cadence.env
+sed_inplace "s|^#\{0,1\}\s*CSERVER_LOGLEVEL=.*|CSERVER_LOGLEVEL=${LOG_LEVEL}|"                config/cadence.env
 
-[ -n "$PG_PASS" ]      && sed_inplace "s|^#\{0,1\}\s*POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"                     config/cadence.env
-[ -n "$REDIS_PASS" ]   && sed_inplace "s|^#\{0,1\}\s*CSERVER_REDISPASSWORD=.*|CSERVER_REDISPASSWORD=${REDIS_PASS}|"           config/cadence.env
+if [ "$DB_BACKEND" = "postgres" ]; then
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESADDRESS=.*|CSERVER_POSTGRESADDRESS=${PG_HOST}|"   config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESPORT=.*|CSERVER_POSTGRESPORT=${PG_PORT}|"         config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESUSER=.*|CSERVER_POSTGRESUSER=${PG_USER}|"         config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_PASS}|"               config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESDBNAME=.*|CSERVER_POSTGRESDBNAME=${PG_DB}|"       config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESTABLENAME=.*|CSERVER_POSTGRESTABLENAME=${PG_TABLE}|" config/cadence.env
+  sed_inplace "s|^#\{0,1\}\s*CSERVER_POSTGRESSSL=.*|CSERVER_POSTGRESSSL=${PG_SSL}|"           config/cadence.env
+fi
+
+[ -n "$ADMIN_TOKEN" ]   && sed_inplace "s|^#\{0,1\}\s*CSERVER_ADMIN_TOKEN=.*|CSERVER_ADMIN_TOKEN=${ADMIN_TOKEN}|"             config/cadence.env
+[ -n "$REDIS_PASS" ]    && sed_inplace "s|^#\{0,1\}\s*CSERVER_REDISPASSWORD=.*|CSERVER_REDISPASSWORD=${REDIS_PASS}|"           config/cadence.env
 [ -n "$PUBLIC_STREAM" ] && sed_inplace "s|^#\{0,1\}\s*CSERVER_PUBLIC_STREAM_URL=.*|CSERVER_PUBLIC_STREAM_URL=${PUBLIC_STREAM}|" config/cadence.env
 
-# Liquidsoap always references /music inside the container
+# Liquidsoap: always /music inside container
 sed_inplace "s|CADENCE_PATH_EXAMPLE|${CONTAINER_MUSIC}|g" config/liquidsoap.liq
 info "Patched config/liquidsoap.liq → music path = ${CONTAINER_MUSIC}"
 
-# Patch HOST_MUSIC_DIR placeholder in docker-compose.yml
-# The compose file ships with a placeholder so this script can fill it in.
+# docker-compose.yml: stamp HOST_MUSIC_DIR
 sed_inplace "s|\${HOST_MUSIC_DIR}|${HOST_MUSIC_DIR}|g" docker-compose.yml
 info "Patched docker-compose.yml → HOST_MUSIC_DIR = ${HOST_MUSIC_DIR}"
+
+# docker-compose.yml: patch all postgres env vars inline so Portainer shows real values
+if [ "$DB_BACKEND" = "postgres" ]; then
+  sed_inplace "s|CSERVER_POSTGRESADDRESS:.*|CSERVER_POSTGRESADDRESS: ${PG_HOST}|"       docker-compose.yml
+  sed_inplace "s|CSERVER_POSTGRESPORT:.*|CSERVER_POSTGRESPORT: \"${PG_PORT}\"|"           docker-compose.yml
+  sed_inplace "s|CSERVER_POSTGRESUSER:.*|CSERVER_POSTGRESUSER: ${PG_USER}|"               docker-compose.yml
+  sed_inplace "s|POSTGRES_PASSWORD:.*changeme.*|POSTGRES_PASSWORD: ${PG_PASS}|"          docker-compose.yml
+  sed_inplace "s|CSERVER_POSTGRESDBNAME:.*|CSERVER_POSTGRESDBNAME: ${PG_DB}|"             docker-compose.yml
+  sed_inplace "s|CSERVER_POSTGRESTABLENAME:.*|CSERVER_POSTGRESTABLENAME: ${PG_TABLE}|"   docker-compose.yml
+  sed_inplace "s|CSERVER_POSTGRESSSL:.*|CSERVER_POSTGRESSSL: ${PG_SSL}|"                 docker-compose.yml
+  sed_inplace "s|CSERVER_DB_BACKEND:.*|CSERVER_DB_BACKEND: postgres|"                     docker-compose.yml
+fi
+
+if [ -n "$ADMIN_TOKEN" ]; then
+  sed_inplace "s|CSERVER_ADMIN_TOKEN:.*|CSERVER_ADMIN_TOKEN: ${ADMIN_TOKEN}|" docker-compose.yml
+fi
+if [ -n "$PUBLIC_STREAM" ]; then
+  sed_inplace "s|CSERVER_PUBLIC_STREAM_URL:.*|CSERVER_PUBLIC_STREAM_URL: ${PUBLIC_STREAM}|" docker-compose.yml
+fi
+sed_inplace "s|CSERVER_LOGLEVEL:.*|CSERVER_LOGLEVEL: ${LOG_LEVEL}|" docker-compose.yml
+
+# If using existing postgres, comment out the postgres service block in compose
+# so Portainer doesn't try to start a container we don't need.
+if [ "$DB_BACKEND" = "postgres" ] && [ "${REMOVE_PG_SERVICE:-false}" = "true" ]; then
+  # Mark the postgres profile service as disabled by prepending a clear comment.
+  # The profiles: ["postgres"] block won't start unless --profile postgres is passed,
+  # but we add a comment for clarity.
+  sed_inplace "/^  postgres:$/i\\  # EXTERNAL POSTGRES — service below is disabled; using ${PG_HOST}" docker-compose.yml
+  info "Noted: postgres container service left in compose but profile-gated (won't start by default)."
+fi
 
 warn "Edit config/icecast.xml and config/liquidsoap.liq: replace CADENCE_PASS_EXAMPLE with real passwords."
 
 # -----------------------------------------------------------------------
 # Build Docker images locally
-# These image names are referenced by docker-compose.yml (no build: block).
 # -----------------------------------------------------------------------
 echo
 step "Building Docker images..."
@@ -149,7 +266,7 @@ docker build \
 info "Built: cadence_liquidsoap:latest"
 
 # -----------------------------------------------------------------------
-# Done — print Portainer instructions
+# Done — Portainer instructions
 # -----------------------------------------------------------------------
 echo
 info "===== Build complete ====="
@@ -159,17 +276,30 @@ echo
 echo "  1. Copy docker-compose.yml to Portainer:"
 echo "       Portainer → Stacks → Add stack → paste docker-compose.yml"
 echo
-echo "  2. Set Portainer stack environment variable:"
-echo "       HOST_MUSIC_DIR = ${HOST_MUSIC_DIR}"
-echo
-echo "  3. Ensure config files are at the paths in docker-compose.yml:"
-echo "       /srv/ssd/HOMELAB/cadence/config/cadence.env"
+echo "  2. Ensure config files are at the paths referenced in docker-compose.yml:"
 echo "       /srv/ssd/HOMELAB/cadence/config/icecast.xml"
 echo "       /srv/ssd/HOMELAB/cadence/config/liquidsoap.liq"
 echo "       /srv/ssd/HOMELAB/cadence/custom.css  (empty file is fine)"
 echo
-echo "  4. Create data directories if needed:"
+echo "  3. Create data directories:"
 echo "       mkdir -p /srv/data/hdd_01/HOMELAB/cadence/data"
+
+if [ "$DB_BACKEND" = "postgres" ] && [ "${PG_DEPLOY_NEW}" = "false" ]; then
+  echo
+  warn "Existing Postgres checklist:"
+  warn "  • User '${PG_USER}' must have CONNECT + CREATE TABLE privileges on '${PG_DB}'"
+  warn "  • 'fuzzystrmatch' extension must exist in '${PG_DB}' (or the user needs CREATE privilege):"
+  warn "      psql -U postgres -d ${PG_DB} -c 'CREATE EXTENSION IF NOT EXISTS fuzzystrmatch;'"
+  warn "  • If using an external host, ensure the Cadence container can reach ${PG_HOST}:${PG_PORT}"
+  warn "      (add to services-net or expose port, depending on your setup)"
+fi
+
+if [ "$DB_BACKEND" = "postgres" ] && [ "${PG_DEPLOY_NEW}" = "true" ]; then
+  echo
+  info "Postgres profile: add 'postgres' to COMPOSE_PROFILES in Portainer, or deploy the postgres"
+  info "service separately. The postgres service is profile-gated in docker-compose.yml."
+fi
+
 echo
 warn "Icecast passwords: edit config/icecast.xml and config/liquidsoap.liq (CADENCE_PASS_EXAMPLE)."
 echo
