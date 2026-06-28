@@ -10,8 +10,7 @@ const API = {
   listenurl: '/api/listenurl',
   sse:       '/api/radiodata/sse',
   version:   '/api/version',
-  bitrate:   '/api/bitrate',
-  listeners: '/api/listeners',
+  status:    '/api/status',
 };
 
 // var so page.js can check `typeof streamSrcURL`.
@@ -47,6 +46,8 @@ sse.onerror = () => {
 };
 
 // ── Info bar ─────────────────────────────────────────────────
+// Single /api/status call replaces two separate fetch calls,
+// halving the number of round-trips on every SSE listener/bitrate event.
 let _infoTimer = null;
 function scheduleInfoUpdate() {
   if (_infoTimer) return;
@@ -54,14 +55,14 @@ function scheduleInfoUpdate() {
 }
 
 function updateInfo() {
-  Promise.all([
-    fetch(API.listeners).then(r => r.json()),
-    fetch(API.bitrate).then(r => r.json()),
-  ]).then(([l, b]) => {
-    const n = (l.Listeners >= 0) ? l.Listeners : '?';
-    const br = (b.Bitrate > 0) ? ' \xb7 ' + b.Bitrate + ' kbps' : '';
-    document.getElementById('listeners').textContent = '\u{1F464} ' + n + br;
-  }).catch(() => {});
+  fetch(API.status)
+    .then(r => r.json())
+    .then(d => {
+      const n  = (d.Listeners >= 0) ? d.Listeners : '?';
+      const br = (d.Bitrate > 0) ? ' \xb7 ' + d.Bitrate + ' kbps' : '';
+      document.getElementById('listeners').textContent = '\u{1F464} ' + n + br;
+    })
+    .catch(() => {});
 }
 
 // ── Version ───────────────────────────────────────────────────

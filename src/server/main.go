@@ -248,6 +248,12 @@ func sighupHandler() {
 			loadConfig()
 			applyLogLevel()
 			resetCleanupRe()
+			// Trim history if HistorySize shrank after reload.
+			historyMu.Lock()
+			if len(history) > c.HistorySize {
+				history = history[len(history)-c.HistorySize:]
+			}
+			historyMu.Unlock()
 			if err := dbPopulate(); err != nil {
 				slog.Error("Rescan after SIGHUP failed.", "error", err)
 			}
@@ -256,51 +262,21 @@ func sighupHandler() {
 	}
 }
 
-// realIP extracts the client IP from the request, respecting
-// c.RealIPHeader and c.TrustedProxy.
-func realIP(r *http.Request) string {
-	if c.RealIPHeader == "" {
-		return r.RemoteAddr
-	}
-	// Only trust the header when the connection comes from the configured proxy.
-	if c.TrustedProxy != "" {
-		host, _, _ := splitHostPort(r.RemoteAddr)
-		if host != c.TrustedProxy {
-			return r.RemoteAddr
-		}
-	}
-	if v := r.Header.Get(c.RealIPHeader); v != "" {
-		// X-Forwarded-For may be a comma-separated list; take the first entry.
-		return strings.TrimSpace(strings.SplitN(v, ",", 2)[0])
-	}
-	return r.RemoteAddr
-}
-
-// splitHostPort is a nil-safe wrapper around net.SplitHostPort.
-func splitHostPort(addr string) (host, port string, err error) {
-	if !strings.Contains(addr, ":") {
-		return addr, "", nil
-	}
-	// Use strings split to avoid importing net just for this helper.
-	i := strings.LastIndex(addr, ":")
-	if i < 0 {
-		return addr, "", nil
-	}
-	return addr[:i], addr[i+1:], nil
-}
-
 // loggingMiddleware logs every request at DEBUG level with the real client IP.
+// It delegates IP extraction to realIP() defined in db_redis.go, which handles
+// CIDR-aware proxy trust and X-Forwarded-For parsing correctly.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rw, r)
+		ip, _ := realIP(r)
 		slog.Debug("HTTP",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.status,
 			"latency", time.Since(start).String(),
-			"remote", realIP(r),
+			"remote", ip,
 		)
 	})
 }
@@ -350,6 +326,16 @@ func main() {
 		slog.Warn("automaxprocs set failed.", "error", err)
 	}
 
+	// Warn when the proxy header is trusted from all sources — safe on a
+	// Docker LAN but dangerous if the port is internet-facing.
+	if c.RealIPHeader != "" && c.TrustedProxy == "" {
+		slog.Warn("CSERVER_REAL_IP_HEADER is set but CSERVER_TRUSTED_PROXY is empty: "+
+			"all RemoteAddr values are trusted as proxies. "+
+			"Set CSERVER_TRUSTED_PROXY to restrict this.",
+			"header", c.RealIPHeader,
+		)
+	}
+
 	slog.Info("Cadence starting.",
 		"version", c.Version,
 		"port", c.Port,
@@ -373,7 +359,7 @@ func main() {
 	handler := loggingMiddleware(routes())
 	slog.Info("HTTP server listening.", "addr", c.Port)
 	if err := http.ListenAndServe(c.Port, handler); err != nil {
-		slog.Error("HTTP server crashed.", "error", err)
+		slog.Error("HTTP server error.", "error", err)
 		os.Exit(1)
 	}
 }

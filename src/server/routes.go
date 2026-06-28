@@ -24,6 +24,7 @@ func routes() http.Handler {
 	r.Handle("/api/listenurl",           ListenURL())
 	r.Handle("/api/listeners",           Listeners())
 	r.Handle("/api/bitrate",             Bitrate())
+	r.Handle("/api/status",              Status())
 	r.Handle("/api/version",             Version())
 	r.Handle("/readyz",                  Readyz())
 	r.Handle("/healthz",                 Healthz())

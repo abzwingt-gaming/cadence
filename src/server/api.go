@@ -328,6 +328,31 @@ func Version() http.HandlerFunc {
 	}
 }
 
+// Status returns a combined snapshot: title, artist, listeners, bitrate, listenurl.
+// Allows the frontend to fetch everything in one round-trip instead of two.
+func Status() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		n := NowSnapshot()
+		listeners := n.Listeners
+		if listeners < 0 {
+			listeners = 0
+		}
+		writeJSON(w, struct {
+			Title     string  `json:"Title"`
+			Artist    string  `json:"Artist"`
+			Listeners int64   `json:"Listeners"`
+			Bitrate   float64 `json:"Bitrate"`
+			ListenURL string  `json:"ListenURL"`
+		}{
+			Title:     n.Song.Title,
+			Artist:    n.Song.Artist,
+			Listeners: listeners,
+			Bitrate:   n.Bitrate,
+			ListenURL: buildPublicStream(n.Host, n.Mountpoint),
+		})
+	}
+}
+
 // AdminRescan triggers a DB rescan. Only registered when CSERVER_DEVMODE=true.
 func AdminRescan() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
