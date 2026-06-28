@@ -6,9 +6,12 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} golang:1.22-alpine AS builder
 ARG TARGETPLATFORM BUILDPLATFORM TARGETOS TARGETARCH
 # Version injected at build time by CI (e.g. --build-arg CSERVER_VERSION=v1.2.3)
 ARG CSERVER_VERSION=dev
+# git is required by go mod download to fetch modules not cached on the proxy
+RUN apk add --no-cache git
 WORKDIR /build
-COPY ./server ./
+COPY ./server/go.mod ./server/go.sum ./
 RUN go mod download
+COPY ./server ./
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build \
       -ldflags="-w -s -X main.buildVersion=${CSERVER_VERSION}" \
